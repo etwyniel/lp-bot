@@ -156,21 +156,9 @@ impl EventHandler for Handler {
         if !new_message.mentions_me(&ctx.http).await.unwrap() || new_message.author.bot {
             return;
         }
-        let mut msg: &str = &new_message.content;
-        let mut no_mentions = String::new();
-        while !msg.is_empty() {
-            let end = if let Some(ndx) = msg.find("<@") {
-                ndx
-            } else {
-                msg.len()
-            };
-            no_mentions.push_str(&msg[..end]);
-            msg = &msg[end..];
-            if let Some(end) = msg.find(">") {
-                msg = &msg[(end + 1)..];
-            }
+        if let Err(e) = self.text_command_lp(&ctx, new_message).await {
+            eprintln!("Failed to start LP from text command: {}", e);
         }
-        dbg!(no_mentions);
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
