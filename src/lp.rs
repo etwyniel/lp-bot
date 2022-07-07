@@ -141,21 +141,32 @@ impl Handler {
         let mut time = None;
         let time_re = Regex::new(r"(?i)(.*?)\s+(at *)?XX:?([0-5]?[0-9])\s*$")?;
         if let Some(cap) = time_re.captures(&no_mentions) {
-            lp_name= Some(cap.get(1).unwrap().as_str().to_string());
+            lp_name = Some(cap.get(1).unwrap().as_str().to_string());
             time = Some(cap.get(3).unwrap().as_str().to_string())
         }
 
-        let channel = match message.channel(&ctx.cache).await {
-            Some(Channel::Guild(c)) => c,
+        let channel = match message.channel(&ctx.http).await? {
+            Channel::Guild(c) => c,
             _ => return Err(anyhow!("Invalid channel")),
         };
         let sender = |contents: String, role_id: Option<u64>| async move {
-            channel.send_message(&ctx.http, |msg| msg
-            .content(&contents)
-            .allowed_mentions(|mentions| mentions.roles(role_id)))
-            .await.map_err(anyhow::Error::from)
+            channel
+                .send_message(&ctx.http, |msg| {
+                    msg.content(&contents)
+                        .allowed_mentions(|mentions| mentions.roles(role_id))
+                })
+                .await
+                .map_err(anyhow::Error::from)
         };
-        self.run_lp(&ctx, message.guild_id.unwrap().0, lp_name, time, None, sender).await
+        self.run_lp(
+            &ctx,
+            message.guild_id.unwrap().0,
+            lp_name,
+            time,
+            None,
+            sender,
+        )
+        .await
     }
 }
 
@@ -178,9 +189,21 @@ impl<'a, 'b> Command<'a, 'b> {
                         })
                 })
                 .await?;
-            self.command.get_interaction_response(&self.ctx.http).await.map_err(anyhow::Error::from)
+            self.command
+                .get_interaction_response(&self.ctx.http)
+                .await
+                .map_err(anyhow::Error::from)
         };
-        self.handler.run_lp(self.ctx, self.command.guild_id.unwrap().0, subject, time, link, sender).await
+        self.handler
+            .run_lp(
+                self.ctx,
+                self.command.guild_id.unwrap().0,
+                subject,
+                time,
+                link,
+                sender,
+            )
+            .await
     }
 
     pub async fn lp(

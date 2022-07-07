@@ -7,12 +7,14 @@ use rspotify::{
     prelude::*,
     ClientCredsSpotify, Credentials,
 };
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serenity::{
     async_trait,
     model::{
         channel::Message,
+        gateway::GatewayIntents,
         gateway::Ready,
+        guild::Role,
         id::GuildId,
         interactions::{
             application_command::{
@@ -21,6 +23,7 @@ use serenity::{
             },
             Interaction, InteractionApplicationCommandCallbackDataFlags, InteractionResponseType,
         },
+        permissions::Permissions,
     },
     prelude::*,
 };
@@ -87,6 +90,24 @@ impl Handler {
             spotify,
         })
     }
+
+    fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
+        let guild_id = match guild_id {
+            Some(id) => id,
+            None => return Err(anyhow!("Must be run in a server")),
+        };
+        let db = self.db.lock().unwrap();
+        match role_id {
+            None => db.execute("DELETE  FROM guild WHERE id = ?1", params![guild_id]),
+            Some(id) => db.execute(
+                "INSERT INTO guild (id, role_id) VALUES (?1, ?2)
+                ON CONFLICT(id) DO UPDATE SET role_id = ?2",
+                params![guild_id, id],
+            ),
+        }
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+    }
 }
 
 impl<'a, 'b> Command<'a, 'b> {
@@ -101,6 +122,20 @@ impl<'a, 'b> Command<'a, 'b> {
             }
         }
         None
+    }
+
+    fn role_opt(&self, name: &str) -> Option<Role> {
+        match self
+            .command
+            .data
+            .options
+            .iter()
+            .find(|opt| opt.name == name)
+            .and_then(|opt| opt.resolved.as_ref())
+        {
+            Some(ApplicationCommandInteractionDataOptionValue::Role(r)) => Some(r.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -130,6 +165,21 @@ impl EventHandler for Handler {
                     let time = cmd.str_opt("time").expect("missing time");
                     let parsed = reltime::parse_time(&time);
                     format!("{} is in <t:{}:R>", time, parsed.timestamp())
+                }
+                "setrole" => {
+                    let role = cmd.role_opt("role");
+                    match self
+                        .set_role(command.guild_id.map(|g| g.0), role.as_ref().map(|r| r.id.0))
+                    {
+                        Err(e) => {
+                            dbg!(&e);
+                            e.to_string()
+                        }
+                        _ => match role {
+                            Some(r) => format!("LP role changed to <@&{}>", r.id.0),
+                            None => format!("LP role removed"),
+                        },
+                    }
                 }
                 _ => "not implemented :(".to_string(),
             };
@@ -218,6 +268,20 @@ impl EventHandler for Handler {
         })
         .await
         .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command
+                .name("setrole")
+                .description("Set what role to ping for listening parties")
+                .create_option(|option| {
+                    option
+                        .name("role")
+                        .description("Role to ping (leave unset to clear)")
+                        .kind(ApplicationCommandOptionType::Role)
+                })
+                .default_member_permissions(Permissions::MANAGE_ROLES)
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -253,7 +317,7 @@ async fn main() {
         .expect("application id is not a valid id");
 
     // Build our client.
-    let mut client = Client::builder(token)
+    let mut client = Client::builder(token, GatewayIntents::GUILD_MESSAGES)
         .event_handler(handler)
         .application_id(application_id)
         .await
