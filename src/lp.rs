@@ -56,6 +56,16 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
 }
 
 impl Handler {
+    pub fn get_create_threads(&self, guild_id: u64) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT create_threads FROM guild WHERE id = ?1",
+            params![guild_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+    }
+
     pub fn get_role_id(&self, guild_id: u64) -> Option<u64> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT role_id FROM guild WHERE id = ?1").ok()?;
@@ -105,16 +115,18 @@ impl Handler {
             resp_content.push_str(&link);
         }
         let message = send_message(resp_content, role_id).await?;
-        // Create thread from response message
-        let mut thread = CreateThread::default();
-        thread
-            .name(lp_name.as_deref().unwrap_or("Listening party"))
-            .kind(ChannelType::PublicThread)
-            .auto_archive_duration(60);
-        let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
-        ctx.http
-            .create_public_thread(message.channel_id.0, message.id.0, &map)
-            .await?;
+        if self.get_create_threads(guild_id) {
+            // Create thread from response message
+            let mut thread = CreateThread::default();
+            thread
+                .name(lp_name.as_deref().unwrap_or("Listening party"))
+                .kind(ChannelType::PublicThread)
+                .auto_archive_duration(60);
+            let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
+            ctx.http
+                .create_public_thread(message.channel_id.0, message.id.0, &map)
+                .await?;
+        }
         Ok(())
     }
 

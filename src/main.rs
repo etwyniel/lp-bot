@@ -91,40 +91,50 @@ impl Handler {
         })
     }
 
+    fn ensure_guild_table(&self, guild_id: u64) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO guild (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
+            params![guild_id],
+        )?;
+        Ok(())
+    }
+
     fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
             None => return Err(anyhow!("Must be run in a server")),
         };
+        self.ensure_guild_table(guild_id)?;
         let db = self.db.lock().unwrap();
-        match role_id {
-            None => db.execute("DELETE  FROM guild WHERE id = ?1", params![guild_id]),
-            Some(id) => db.execute(
-                "INSERT INTO guild (id, role_id) VALUES (?1, ?2)
-                ON CONFLICT(id) DO UPDATE SET role_id = ?2",
-                params![guild_id, id],
-            ),
-        }
-        .map(|_| ())
-        .map_err(anyhow::Error::from)
+        db.execute(
+            "UPDATE guild SET role_id = ?1 WHERE id = ?2",
+            params![role_id, guild_id],
+        )?;
+        Ok(())
+    }
+
+    fn set_should_create_threads(&self, guild_id: Option<u64>, create: bool) -> anyhow::Result<()> {
+        let guild_id = match guild_id {
+            Some(id) => id,
+            None => return Err(anyhow!("Must be run in a server")),
+        };
+        self.ensure_guild_table(guild_id)?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE guild SET create_threads = ?1 WHERE id = ?2",
+            params![create, guild_id],
+        )?;
+        Ok(())
     }
 }
 
 impl<'a, 'b> Command<'a, 'b> {
-    fn str_opt(&self, name: &str) -> Option<String> {
-        for opt in &self.command.data.options {
-            if opt.name == name {
-                if let Some(ApplicationCommandInteractionDataOptionValue::String(s)) = &opt.resolved
-                {
-                    return Some(s.to_string());
-                }
-                return None;
-            }
-        }
-        None
-    }
-
-    fn role_opt(&self, name: &str) -> Option<Role> {
+    fn opt<T>(
+        &self,
+        name: &str,
+        getter: impl FnOnce(&ApplicationCommandInteractionDataOptionValue) -> Option<T>,
+    ) -> Option<T> {
         match self
             .command
             .data
@@ -133,9 +143,39 @@ impl<'a, 'b> Command<'a, 'b> {
             .find(|opt| opt.name == name)
             .and_then(|opt| opt.resolved.as_ref())
         {
-            Some(ApplicationCommandInteractionDataOptionValue::Role(r)) => Some(r.clone()),
+            Some(o) => getter(o),
             _ => None,
         }
+    }
+
+    fn str_opt(&self, name: &str) -> Option<String> {
+        self.opt(name, |o| {
+            if let ApplicationCommandInteractionDataOptionValue::String(s) = o {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn role_opt(&self, name: &str) -> Option<Role> {
+        self.opt(name, |o| {
+            if let ApplicationCommandInteractionDataOptionValue::Role(r) = o {
+                Some(r.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn bool_opt(&self, name: &str) -> Option<bool> {
+        self.opt(name, |o| {
+            if let ApplicationCommandInteractionDataOptionValue::Boolean(b) = o {
+                Some(*b)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -179,6 +219,22 @@ impl EventHandler for Handler {
                             Some(r) => format!("LP role changed to <@&{}>", r.id.0),
                             None => format!("LP role removed"),
                         },
+                    }
+                }
+                "setcreatethreads" => {
+                    let b = cmd.bool_opt("create_threads");
+                    match self.set_should_create_threads(
+                        command.guild_id.map(|g| g.0),
+                        b.unwrap_or(false),
+                    ) {
+                        Err(e) => {
+                            dbg!(&e);
+                            e.to_string()
+                        }
+                        _ => format!(
+                            "LPBot will {}create threads for listening parties",
+                            if b == Some(true) { "" } else { "not " }
+                        ),
                     }
                 }
                 _ => "not implemented :(".to_string(),
@@ -282,6 +338,21 @@ impl EventHandler for Handler {
         })
         .await
         .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command
+                .name("setcreatethreads")
+                .description("Configure whether LPBot should create threads for LPs")
+                .create_option(|option| {
+                    option
+                        .name("create_threads")
+                        .description("Create threads for LPs")
+                        .kind(ApplicationCommandOptionType::Boolean)
+                        .required(true)
+                })
+                .default_member_permissions(Permissions::MANAGE_THREADS)
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -290,7 +361,8 @@ fn init_db() -> anyhow::Result<Connection> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS guild (
             id INTEGER PRIMARY KEY,
-            role_id INTEGER
+            role_id INTEGER,
+            create_threads BOOLEAN NOT NULL DEFAULT(TRUE)
         )",
         [],
     )?;
