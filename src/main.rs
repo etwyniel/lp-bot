@@ -1,12 +1,9 @@
 use std::{env, sync};
 
-use anyhow::anyhow;
-use lp::Command;
-use rspotify::{
-    model::{AlbumId, SearchType, SimplifiedAlbum},
-    prelude::*,
-    ClientCredsSpotify, Credentials,
-};
+use album::Album;
+use anyhow::bail;
+use command_context::TextCommand;
+use lastfm::Lastfm;
 use rusqlite::{params, Connection};
 use serenity::{
     async_trait,
@@ -14,80 +11,68 @@ use serenity::{
         channel::Message,
         gateway::GatewayIntents,
         gateway::Ready,
-        guild::Role,
         id::GuildId,
         interactions::{
-            application_command::{
-                ApplicationCommand, ApplicationCommandInteractionDataOptionValue,
-                ApplicationCommandOptionType,
-            },
+            application_command::{ApplicationCommand, ApplicationCommandOptionType},
             Interaction, InteractionApplicationCommandCallbackDataFlags, InteractionResponseType,
         },
         permissions::Permissions,
     },
     prelude::*,
 };
+use spotify::Spotify;
+mod album;
+mod bandcamp;
+mod command_context;
+mod lastfm;
 mod lp;
 mod reltime;
+mod spotify;
+
+use crate::{album::AlbumProvider, command_context::SlashCommand};
+use bandcamp::Bandcamp;
 
 pub struct Handler {
     db: sync::Mutex<Connection>,
-    spotify: rspotify::ClientCredsSpotify,
-}
-
-fn album_info(album: &SimplifiedAlbum) -> Option<(String, String)> {
-    let url = album.id.as_ref()?.url();
-    let title = match &album
-        .album_group
-        .as_ref()
-        .or_else(|| album.artists.first().map(|a| &a.name))
-    {
-        Some(grp) => format!("{} - {}", grp, &album.name),
-        None => album.name.clone(),
-    };
-    Some((url, title))
+    providers: Vec<Box<dyn AlbumProvider>>,
+    lastfm: Lastfm,
 }
 
 impl Handler {
-    async fn lookup_album(&self, query: &str) -> anyhow::Result<Option<(String, String)>> {
-        self.spotify.auto_reauth().await?;
-        let res = self
-            .spotify
-            .search(query, &SearchType::Album, None, None, Some(1), None)
-            .await?;
-        if let rspotify::model::SearchResult::Albums(albums) = res {
-            Ok(albums.items.first().and_then(album_info))
-        } else {
-            Err(anyhow!("Album not found"))
-        }
-    }
-
-    async fn get_album_info(&self, link: &str) -> anyhow::Result<Option<String>> {
-        if let Some(id) = link.strip_prefix("https://open.spotify.com/album/") {
-            self.spotify.auto_reauth().await?;
-            let album_id = id.split('?').next().unwrap();
-            let album = self.spotify.album(&AlbumId::from_id(album_id)?).await?;
-            let title = match &album.artists.first().map(|a| &a.name) {
-                Some(grp) => format!("{} - {}", grp, &album.name),
-                None => album.name.clone(),
-            };
-            return Ok(Some(title));
+    async fn get_album_info(&self, link: &str) -> anyhow::Result<Option<Album>> {
+        if let Some(p) = self.providers.iter().find(|p| p.url_matches(link)) {
+            let info = p.get_from_url(link).await?;
+            return Ok(Some(info));
         }
         Ok(None)
     }
 
+    pub async fn lookup_album(
+        &self,
+        query: &str,
+        provider: Option<String>,
+    ) -> anyhow::Result<Option<Album>> {
+        let p = match provider
+            .and_then(|id| self.providers.iter().find(|p| p.id() == id))
+            .or_else(|| self.providers.first())
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        p.query_album(query).await.map(Some)
+    }
+
     async fn new() -> anyhow::Result<Self> {
         let conn = init_db()?;
-
-        let creds = Credentials::from_env().ok_or(anyhow!("No spotify credentials"))?;
-        let mut spotify = ClientCredsSpotify::new(creds);
-
-        // Obtaining the access token
-        spotify.request_token().await?;
-        spotify.auto_reauth().await?;
+        let providers = vec![
+            Box::new(Spotify::new().await?) as Box<dyn AlbumProvider>,
+            Box::new(Bandcamp::new()),
+        ];
+        let lastfm = Lastfm::new();
         Ok(Handler {
             db: sync::Mutex::new(conn),
-            spotify,
+            providers,
+            lastfm,
         })
     }
 
@@ -95,7 +80,7 @@ impl Handler {
         let db = self.db.lock().unwrap();
         db.execute(
             "INSERT INTO guild (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
-            params![guild_id],
+            [guild_id],
         )?;
         Ok(())
     }
@@ -103,7 +88,7 @@ impl Handler {
     fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
-            None => return Err(anyhow!("Must be run in a server")),
+            None => bail!("Must be run in a server"),
         };
         self.ensure_guild_table(guild_id)?;
         let db = self.db.lock().unwrap();
@@ -117,7 +102,7 @@ impl Handler {
     fn set_should_create_threads(&self, guild_id: Option<u64>, create: bool) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
-            None => return Err(anyhow!("Must be run in a server")),
+            None => bail!("Must be run in a server"),
         };
         self.ensure_guild_table(guild_id)?;
         let db = self.db.lock().unwrap();
@@ -127,55 +112,79 @@ impl Handler {
         )?;
         Ok(())
     }
-}
 
-impl<'a, 'b> Command<'a, 'b> {
-    fn opt<T>(
-        &self,
-        name: &str,
-        getter: impl FnOnce(&ApplicationCommandInteractionDataOptionValue) -> Option<T>,
-    ) -> Option<T> {
-        match self
-            .command
-            .data
-            .options
-            .iter()
-            .find(|opt| opt.name == name)
-            .and_then(|opt| opt.resolved.as_ref())
-        {
-            Some(o) => getter(o),
-            _ => None,
+    async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<Option<String>> {
+        match cmd.name() {
+            "lp" => {
+                let lp_name = cmd.str_opt("album");
+                let time = cmd.str_opt("time");
+                let link = cmd.str_opt("link");
+                let provider = cmd.str_opt("provider");
+                cmd.run_lp(lp_name, link, time, provider)
+                    .await
+                    .map(|_| None)
+            }
+            "album" => {
+                let album_query = cmd.str_opt("album").unwrap();
+                let provider = cmd.str_opt("provider");
+                match self.lookup_album(&album_query, provider).await? {
+                    None => bail!("Not found"),
+                    Some(mut info) => {
+                        let mut contents = format!(
+                            "{} - {}{}",
+                            info.name.as_deref().unwrap_or("unknown"),
+                            info.artist.as_deref().unwrap_or("unknown artist"),
+                            info.release_date
+                                .map(|d| format!(" ({})", d))
+                                .unwrap_or_default(),
+                        );
+                        if info.genres.is_empty() {
+                            if let Some(artist) = &info.artist {
+                                info.genres = self.lastfm.artist_top_tags(artist).await?;
+                            }
+                        }
+                        if !info.genres.is_empty() {
+                            contents.push('\n');
+                            contents.push_str(&info.genres.join(", "));
+                        }
+                        contents.push('\n');
+                        contents.push_str(info.url.as_deref().unwrap_or("no link found"));
+                        Ok(Some(contents))
+                    }
+                }
+            }
+            "relative" => {
+                let time = cmd.str_opt("time").expect("missing time");
+                let parsed = reltime::parse_time(&time);
+                let contents = format!("{} is in <t:{}:R>", time, parsed.timestamp());
+                Ok(Some(contents))
+            }
+            "setrole" => {
+                let role = cmd.role_opt("role");
+                self.set_role(
+                    cmd.command.guild_id.map(|g| g.0),
+                    role.as_ref().map(|r| r.id.0),
+                )?;
+                let contents = match role {
+                    Some(r) => format!("LP role changed to <@&{}>", r.id.0),
+                    None => format!("LP role removed"),
+                };
+                Ok(Some(contents))
+            }
+            "setcreatethreads" => {
+                let b = cmd.bool_opt("create_threads");
+                self.set_should_create_threads(
+                    cmd.command.guild_id.map(|g| g.0),
+                    b.unwrap_or(false),
+                )?;
+                let contents = format!(
+                    "LPBot will {}create threads for listening parties",
+                    if b == Some(true) { "" } else { "not " }
+                );
+                Ok(Some(contents))
+            }
+            _ => bail!("Unknown command"),
         }
-    }
-
-    fn str_opt(&self, name: &str) -> Option<String> {
-        self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::String(s) = o {
-                Some(s.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    fn role_opt(&self, name: &str) -> Option<Role> {
-        self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::Role(r) = o {
-                Some(r.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    fn bool_opt(&self, name: &str) -> Option<bool> {
-        self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::Boolean(b) = o {
-                Some(*b)
-            } else {
-                None
-            }
-        })
     }
 }
 
@@ -183,76 +192,36 @@ impl<'a, 'b> Command<'a, 'b> {
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            let cmd = Command {
+            let cmd = SlashCommand {
                 handler: self,
                 ctx: &ctx,
                 command: &command,
             };
-            let content = match command.data.name.as_str() {
-                "lp" => {
-                    let lp_name = cmd.str_opt("album");
-                    let time = cmd.str_opt("time");
-                    let link = cmd.str_opt("link");
-                    match cmd.lp(lp_name, link, time).await {
-                        Err(e) => {
-                            dbg!(&e);
-                            e.to_string()
-                        }
-                        _ => return,
-                    }
+            let (contents, flags) = match self.process_command(cmd).await {
+                Ok(None) => return,
+                Ok(Some(s)) => (s, InteractionApplicationCommandCallbackDataFlags::empty()),
+                Err(e) => {
+                    eprintln!(
+                        "Error processing command {}: {:?}",
+                        &command.data.name,
+                        e.to_string()
+                    );
+                    (
+                        e.to_string(),
+                        InteractionApplicationCommandCallbackDataFlags::EPHEMERAL,
+                    )
                 }
-                "relative" => {
-                    let time = cmd.str_opt("time").expect("missing time");
-                    let parsed = reltime::parse_time(&time);
-                    format!("{} is in <t:{}:R>", time, parsed.timestamp())
-                }
-                "setrole" => {
-                    let role = cmd.role_opt("role");
-                    match self
-                        .set_role(command.guild_id.map(|g| g.0), role.as_ref().map(|r| r.id.0))
-                    {
-                        Err(e) => {
-                            dbg!(&e);
-                            e.to_string()
-                        }
-                        _ => match role {
-                            Some(r) => format!("LP role changed to <@&{}>", r.id.0),
-                            None => format!("LP role removed"),
-                        },
-                    }
-                }
-                "setcreatethreads" => {
-                    let b = cmd.bool_opt("create_threads");
-                    match self.set_should_create_threads(
-                        command.guild_id.map(|g| g.0),
-                        b.unwrap_or(false),
-                    ) {
-                        Err(e) => {
-                            dbg!(&e);
-                            e.to_string()
-                        }
-                        _ => format!(
-                            "LPBot will {}create threads for listening parties",
-                            if b == Some(true) { "" } else { "not " }
-                        ),
-                    }
-                }
-                _ => "not implemented :(".to_string(),
             };
 
             if let Err(why) = command
                 .create_interaction_response(&ctx.http, |response| {
                     response
                         .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| {
-                            message
-                                .content(content)
-                                .flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-                        })
+                        .interaction_response_data(|message| message.content(contents).flags(flags))
                 })
                 .await
             {
-                println!("cannot respond to slash command: {}", why);
+                eprintln!("cannot respond to slash command: {}", why);
                 return;
             }
         }
@@ -262,7 +231,12 @@ impl EventHandler for Handler {
         if !new_message.mentions_me(&ctx.http).await.unwrap() || new_message.author.bot {
             return;
         }
-        if let Err(e) = self.text_command_lp(&ctx, new_message).await {
+        let text_command = TextCommand {
+            ctx: &ctx,
+            handler: self,
+            message: &new_message,
+        };
+        if let Err(e) = text_command.run_lp().await {
             eprintln!("Failed to start LP from text command: {}", e);
         }
     }
@@ -298,6 +272,12 @@ impl EventHandler for Handler {
         .await
         .unwrap();
 
+        let providers = self
+            .providers
+            .iter()
+            .map(|p| p.id())
+            .take(25)
+            .collect::<Vec<_>>();
         ApplicationCommand::create_global_application_command(&ctx.http, |command| {
             command
                 .name("lp")
@@ -320,6 +300,40 @@ impl EventHandler for Handler {
                         .name("link")
                         .description("Link to the album/playlist (Spotify, Youtube, Bandcamp...)")
                         .kind(ApplicationCommandOptionType::String)
+                })
+                .create_option(|option| {
+                    let opt = option
+                        .name("provider")
+                        .description("Where to look for album info (defaults to spotify)")
+                        .kind(ApplicationCommandOptionType::String);
+                    providers.iter().for_each(|p| {
+                        opt.add_string_choice(p, p);
+                    });
+                    opt
+                })
+        })
+        .await
+        .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command
+                .name("album")
+                .description("Lookup an album")
+                .create_option(|option| {
+                    option
+                        .name("album")
+                        .description("The album you are looking for (e.g. band - album)")
+                        .kind(ApplicationCommandOptionType::String)
+                        .required(true)
+                })
+                .create_option(|option| {
+                    let opt = option
+                        .name("provider")
+                        .description("Where to look for album info (defaults to spotify)")
+                        .kind(ApplicationCommandOptionType::String);
+                    providers.iter().for_each(|p| {
+                        opt.add_string_choice(p, p);
+                    });
+                    opt
                 })
         })
         .await

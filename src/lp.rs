@@ -1,29 +1,17 @@
-use std::future::Future;
 use std::ops::Add;
 
-use anyhow::anyhow;
+use anyhow::bail;
 use chrono::{prelude::*, Duration};
 use regex::Regex;
-use rusqlite::params;
 use serde_json::Map;
-use serenity::{
-    builder::CreateThread,
-    model::{
-        channel::{Channel, ChannelType, Message},
-        interactions::{
-            application_command::ApplicationCommandInteraction, InteractionResponseType,
-        },
-    },
-    prelude::*,
+use serenity::{builder::CreateThread, model::channel::ChannelType};
+
+use crate::album::Album;
+use crate::command_context::Responder;
+use crate::{
+    command_context::{SlashCommand, TextCommand},
+    Handler,
 };
-
-use crate::Handler;
-
-pub struct Command<'a, 'b> {
-    pub handler: &'a Handler,
-    pub ctx: &'b Context,
-    pub command: &'b ApplicationCommandInteraction,
-}
 
 fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     let time = match time {
@@ -36,7 +24,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     if let Some(cap) = xx_re.captures(time) {
         let min: i64 = cap.get(2).unwrap().as_str().parse()?;
         if !(0..60).contains(&min) {
-            return Err(anyhow!("Invalid time"));
+            bail!("Invalid time");
         }
         let cur_min = lp_time.minute() as i64;
         let to_add = if cur_min <= min {
@@ -49,10 +37,79 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         let extra_mins: i64 = cap.get(1).unwrap().as_str().parse()?;
         lp_time = lp_time.add(Duration::minutes(extra_mins));
     } else {
-        return Err(anyhow!("Invalid time {}", time));
+        bail!("Invalid time {}", time);
     }
 
     Ok(format!("at <t:{0:}:t> (<t:{0:}:R>)", lp_time.timestamp()))
+}
+
+pub async fn run_lp<T: Responder>(
+    responder: &T,
+    guild_id: u64,
+    mut lp_name: Option<String>,
+    time: Option<String>,
+    mut link: Option<String>,
+    provider: Option<String>,
+) -> anyhow::Result<()> {
+    if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
+        // As a special case for convenience, if we have a URL in lp_name, use that as link
+        if link.is_some() {
+            bail!("Too many links!");
+        }
+        link = lp_name.take();
+    }
+    let handler = responder.handler();
+    let mut info = match (&lp_name, &link) {
+        (Some(name), None) => handler.lookup_album(name, provider).await?,
+        (None, Some(lnk)) => handler.get_album_info(lnk).await?,
+        (None, None) => bail!("Please specify something to LP"),
+        (Some(_), Some(_)) => None,
+    }
+    .unwrap_or_else(|| Album {
+        name: lp_name,
+        url: link,
+        ..Default::default()
+    });
+    let when = convert_lp_time(time.as_deref())?;
+    let role_id = handler.get_role_id(guild_id);
+    let lp_name = match (&info.name, &info.artist) {
+        (Some(name), Some(artist)) => format!("{} - {}", name, artist),
+        (Some(name), None) => name.to_string(),
+        _ => "this".to_string(),
+    };
+    if info.genres.is_empty() {
+        if let Some(artist) = &info.artist {
+            info.genres = responder.handler().lastfm.artist_top_tags(artist).await?;
+        }
+    }
+    let mut resp_content = format!(
+        "{} {} {}",
+        role_id
+            .map(|id| format!("<@&{}>", id))
+            .unwrap_or("Listening party: ".to_string()),
+        lp_name,
+        when
+    );
+    if let Some(link) = info.url {
+        resp_content.push_str("\n");
+        resp_content.push_str(&link);
+    }
+    let message = responder.respond(&resp_content, role_id).await?;
+    if handler.get_create_threads(guild_id) {
+        // Create thread from response message
+        let mut thread = CreateThread::default();
+        thread
+            .name(info.name.as_deref().unwrap_or("Listening party"))
+            .kind(ChannelType::PublicThread)
+            .auto_archive_duration(60);
+        let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
+        responder
+            .ctx()
+            .http
+            .create_public_thread(message.channel_id.0, message.id.0, &map)
+            .await?;
+    }
+    Ok(())
 }
 
 impl Handler {
@@ -60,7 +117,7 @@ impl Handler {
         let db = self.db.lock().unwrap();
         db.query_row(
             "SELECT create_threads FROM guild WHERE id = ?1",
-            params![guild_id],
+            [guild_id],
             |row| row.get(0),
         )
         .unwrap_or(false)
@@ -69,69 +126,13 @@ impl Handler {
     pub fn get_role_id(&self, guild_id: u64) -> Option<u64> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT role_id FROM guild WHERE id = ?1").ok()?;
-        stmt.query_row(params![guild_id], |row| row.get(0)).ok()
+        stmt.query_row([guild_id], |row| row.get(0)).ok()
     }
+}
 
-    pub async fn run_lp<Fut: Future<Output = anyhow::Result<Message>>>(
-        &self,
-        ctx: &Context,
-        guild_id: u64,
-        mut lp_name: Option<String>,
-        time: Option<String>,
-        mut link: Option<String>,
-        send_message: impl FnOnce(String, Option<u64>) -> Fut,
-    ) -> anyhow::Result<()> {
-        if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
-            // As a special case for convenience, if we have a URL in lp_name, use that as link
-            if link.is_some() {
-                return Err(anyhow!("Too many links!"));
-            }
-            link = lp_name.take();
-        }
-        match (&lp_name, &link) {
-            (Some(name), None) => match self.lookup_album(name).await? {
-                Some((lnk, title)) => {
-                    link = Some(lnk);
-                    lp_name = Some(title);
-                }
-                _ => {}
-            },
-            (None, Some(lnk)) => lp_name = self.get_album_info(lnk).await?,
-            (None, None) => return Err(anyhow!("Please specify something to LP")),
-            _ => {}
-        }
-        let when = convert_lp_time(time.as_deref())?;
-        let role_id = self.get_role_id(guild_id);
-        let mut resp_content = format!(
-            "{} {} {}",
-            role_id
-                .map(|id| format!("<@&{}>", id))
-                .unwrap_or("Listening party: ".to_string()),
-            lp_name.as_deref().unwrap_or("this"),
-            when
-        );
-        if let Some(link) = link {
-            resp_content.push_str("\n");
-            resp_content.push_str(&link);
-        }
-        let message = send_message(resp_content, role_id).await?;
-        if self.get_create_threads(guild_id) {
-            // Create thread from response message
-            let mut thread = CreateThread::default();
-            thread
-                .name(lp_name.as_deref().unwrap_or("Listening party"))
-                .kind(ChannelType::PublicThread)
-                .auto_archive_duration(60);
-            let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
-            ctx.http
-                .create_public_thread(message.channel_id.0, message.id.0, &map)
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn text_command_lp(&self, ctx: &Context, message: Message) -> anyhow::Result<()> {
-        let mut msg: &str = &message.content;
+impl TextCommand<'_, '_> {
+    pub async fn run_lp(&self) -> anyhow::Result<()> {
+        let mut msg: &str = &self.message.content;
         // Remove mentions from message
         let mut no_mentions = String::new();
         while !msg.is_empty() {
@@ -157,73 +158,34 @@ impl Handler {
             time = Some(cap.get(3).unwrap().as_str().to_string())
         }
 
-        let channel = match message.channel(&ctx.http).await? {
-            Channel::Guild(c) => c,
-            _ => return Err(anyhow!("Invalid channel")),
-        };
-        let sender = |contents: String, role_id: Option<u64>| async move {
-            channel
-                .send_message(&ctx.http, |msg| {
-                    msg.content(&contents)
-                        .allowed_mentions(|mentions| mentions.roles(role_id))
-                })
-                .await
-                .map_err(anyhow::Error::from)
-        };
-        self.run_lp(
-            &ctx,
-            message.guild_id.unwrap().0,
+        run_lp(
+            self,
+            self.message.guild_id.unwrap().0,
             lp_name,
             time,
             None,
-            sender,
+            None,
         )
         .await
     }
 }
 
-impl<'a, 'b> Command<'a, 'b> {
+impl<'a, 'b> SlashCommand<'a, 'b> {
     pub async fn run_lp(
         &self,
         subject: Option<String>,
         time: Option<String>,
         link: Option<String>,
+        provider: Option<String>,
     ) -> anyhow::Result<()> {
-        let sender = |contents: String, role_id: Option<u64>| async move {
-            self.command
-                .create_interaction_response(&self.ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| {
-                            message
-                                .content(&contents)
-                                .allowed_mentions(|m| m.roles(role_id))
-                        })
-                })
-                .await?;
-            self.command
-                .get_interaction_response(&self.ctx.http)
-                .await
-                .map_err(anyhow::Error::from)
-        };
-        self.handler
-            .run_lp(
-                self.ctx,
-                self.command.guild_id.unwrap().0,
-                subject,
-                time,
-                link,
-                sender,
-            )
-            .await
-    }
-
-    pub async fn lp(
-        &self,
-        lp_name: Option<String>,
-        link: Option<String>,
-        time: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.run_lp(lp_name, time, link).await
+        run_lp(
+            self,
+            self.command.guild_id.unwrap().0,
+            subject,
+            link,
+            time,
+            provider,
+        )
+        .await
     }
 }
