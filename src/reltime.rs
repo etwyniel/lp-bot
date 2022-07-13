@@ -12,7 +12,7 @@ pub fn parse_time(time: &str) -> DateTime<FixedOffset> {
     let now = Utc::now();
     let mut now_tz = now.with_timezone(&offset);
     let (hour, mut min) = time.split_once(':').expect("Invalid time format");
-    let mut hour = u32::from_str_radix(hour, 10).unwrap();
+    let mut hour = hour.parse::<u32>().unwrap();
     if min.ends_with("am") {
         if hour == 12 {
             hour = 0;
@@ -24,7 +24,7 @@ pub fn parse_time(time: &str) -> DateTime<FixedOffset> {
         }
         min = min.trim_end_matches("pm");
     }
-    let min = u32::from_str_radix(min, 10).unwrap();
+    let min = min.parse::<u32>().unwrap();
     while now_tz.minute() != min {
         now_tz = now_tz.add(Duration::minutes(1));
     }

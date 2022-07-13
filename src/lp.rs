@@ -1,13 +1,15 @@
+use std::fmt::Write;
 use std::ops::Add;
 
 use anyhow::bail;
 use chrono::{prelude::*, Duration};
 use regex::Regex;
 use serde_json::Map;
+use serenity::model::interactions::application_command::ApplicationCommandInteractionDataOption;
 use serenity::{builder::CreateThread, model::channel::ChannelType};
 
 use crate::album::Album;
-use crate::command_context::Responder;
+use crate::command_context::{get_focused_option, get_str_opt_ac, Responder};
 use crate::{
     command_context::{SlashCommand, TextCommand},
     Handler,
@@ -43,6 +45,42 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     Ok(format!("at <t:{0:}:t> (<t:{0:}:R>)", lp_time.timestamp()))
 }
 
+async fn build_message_contents(
+    handler: &Handler,
+    info: &mut Album,
+    time: Option<&str>,
+    role_id: Option<u64>,
+) -> anyhow::Result<String> {
+    let when = convert_lp_time(time)?;
+    let lp_name = info.format_name();
+    if info.genres.is_empty() {
+        if let Some(artist) = &info.artist {
+            info.genres = match handler.lastfm.artist_top_tags(artist).await {
+                Ok(genres) => genres,
+                Err(err) => {
+                    eprintln!("Couldn't retrieve genres from lastfm: {}", err);
+                    vec![]
+                }
+            };
+        }
+    }
+    let mut resp_content = format!(
+        "{} {} {}\n",
+        role_id
+            .map(|id| format!("<@&{}>", id))
+            .unwrap_or_else(|| "Listening party: ".to_string()),
+        lp_name,
+        when
+    );
+    if let Some(genres) = info.format_genres() {
+        _ = writeln!(&mut resp_content, "{}", &genres);
+    }
+    if let Some(link) = &info.url {
+        _ = writeln!(&mut resp_content, "{}", &link);
+    }
+    Ok(resp_content)
+}
+
 pub async fn run_lp<T: Responder>(
     responder: &T,
     guild_id: u64,
@@ -53,7 +91,7 @@ pub async fn run_lp<T: Responder>(
 ) -> anyhow::Result<()> {
     if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
         // As a special case for convenience, if we have a URL in lp_name, use that as link
-        if link.is_some() {
+        if link.is_some() && link != lp_name {
             bail!("Too many links!");
         }
         link = lp_name.take();
@@ -70,43 +108,27 @@ pub async fn run_lp<T: Responder>(
         url: link,
         ..Default::default()
     });
-    let when = convert_lp_time(time.as_deref())?;
     let role_id = handler.get_role_id(guild_id);
-    let lp_name = match (&info.name, &info.artist) {
-        (Some(name), Some(artist)) => format!("{} - {}", name, artist),
-        (Some(name), None) => name.to_string(),
-        _ => "this".to_string(),
-    };
-    if info.genres.is_empty() {
-        if let Some(artist) = &info.artist {
-            info.genres = responder.handler().lastfm.artist_top_tags(artist).await?;
-        }
-    }
-    let mut resp_content = format!(
-        "{} {} {}",
-        role_id
-            .map(|id| format!("<@&{}>", id))
-            .unwrap_or("Listening party: ".to_string()),
-        lp_name,
-        when
-    );
-    if let Some(link) = info.url {
-        resp_content.push_str("\n");
-        resp_content.push_str(&link);
-    }
+    let resp_content = build_message_contents(handler, &mut info, time.as_deref(), role_id).await?;
     let message = responder.respond(&resp_content, role_id).await?;
+    let http = &responder.ctx().http;
     if handler.get_create_threads(guild_id) {
+        let chan = message.channel(http).await?;
+        let thread_name = info.name.as_deref().unwrap_or("Listening party");
+        if let Some((ChannelType::PublicThread, c)) = chan.guild().map(|c| (c.kind, c)) {
+            if c.kind == ChannelType::PublicThread {
+                c.edit_thread(http, |t| t.name(&thread_name)).await?;
+                return Ok(());
+            }
+        }
         // Create thread from response message
         let mut thread = CreateThread::default();
         thread
-            .name(info.name.as_deref().unwrap_or("Listening party"))
+            .name(thread_name)
             .kind(ChannelType::PublicThread)
             .auto_archive_duration(60);
         let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
-        responder
-            .ctx()
-            .http
-            .create_public_thread(message.channel_id.0, message.id.0, &map)
+        http.create_public_thread(message.channel_id.0, message.id.0, &map)
             .await?;
     }
     Ok(())
@@ -128,6 +150,34 @@ impl Handler {
         let mut stmt = db.prepare("SELECT role_id FROM guild WHERE id = ?1").ok()?;
         stmt.query_row([guild_id], |row| row.get(0)).ok()
     }
+
+    pub async fn autocomplete_lp(
+        &self,
+        options: &[ApplicationCommandInteractionDataOption],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut choices = vec![];
+        let mut provider = get_str_opt_ac(options, "provider");
+        let focused = get_focused_option(options);
+        let mut album = get_str_opt_ac(options, "album");
+        if let (Some(mut s), Some("album")) = (&mut album, focused) {
+            if s.len() >= 7 && !s.starts_with("https://") {
+                if let (None, Some(stripped)) = (&provider, s.strip_prefix("bc:")) {
+                    s = stripped;
+                    provider = Some("bandcamp");
+                }
+                choices = self.query_albums(s, provider).await.unwrap_or_default();
+            }
+            if !s.is_empty() {
+                choices.push((s.to_string(), s.to_string()));
+            }
+        } else if let (Some("link"), Some(album)) = (focused, &album) {
+            // If album contains a url, suggest using the same url for link
+            if album.starts_with("https://") {
+                choices.push((album.to_string(), album.to_string()));
+            }
+        }
+        Ok(choices)
+    }
 }
 
 impl TextCommand<'_, '_> {
@@ -143,7 +193,7 @@ impl TextCommand<'_, '_> {
             };
             no_mentions.push_str(&msg[..end]);
             msg = &msg[end..];
-            if let Some(end) = msg.find(">") {
+            if let Some(end) = msg.find('>') {
                 msg = &msg[(end + 1)..];
             }
         }

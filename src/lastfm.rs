@@ -55,7 +55,7 @@ impl Lastfm {
                 .append_pair("format", "json");
             params
                 .into_iter()
-                .fold(&mut pairs, |pairs, (k, v)| pairs.append_pair(k, &v));
+                .fold(&mut pairs, |pairs, (k, v)| pairs.append_pair(k, v));
         }
         self.client
             .get(url)
@@ -70,6 +70,12 @@ impl Lastfm {
         let top_tags: ArtistTopTags = self
             .query("artist.getTopTags", [("artist", artist)])
             .await?;
-        Ok(top_tags.toptags.tag.into_iter().take(5).map(|t| t.name).collect())
+        Ok(top_tags
+            .toptags
+            .tag
+            .into_iter()
+            .take(5)
+            .map(|t| t.name)
+            .collect())
     }
 }

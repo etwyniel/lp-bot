@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::{env, sync};
 
 use album::Album;
@@ -5,6 +6,7 @@ use anyhow::bail;
 use command_context::TextCommand;
 use lastfm::Lastfm;
 use rusqlite::{params, Connection};
+use serenity::model::interactions::autocomplete::AutocompleteInteraction;
 use serenity::{
     async_trait,
     model::{
@@ -39,6 +41,28 @@ pub struct Handler {
 }
 
 impl Handler {
+    async fn new() -> anyhow::Result<Self> {
+        let conn = init_db()?;
+        let providers = vec![
+            Box::new(Spotify::new().await?) as Box<dyn AlbumProvider>,
+            Box::new(Bandcamp::new()),
+        ];
+        let lastfm = Lastfm::new();
+        Ok(Handler {
+            db: sync::Mutex::new(conn),
+            providers,
+            lastfm,
+        })
+    }
+
+    pub fn get_provider(&self, provider: Option<&str>) -> &dyn AlbumProvider {
+        provider
+            .and_then(|id| self.providers.iter().find(|p| p.id() == id))
+            .or_else(|| self.providers.first())
+            .unwrap()
+            .as_ref()
+    }
+
     async fn get_album_info(&self, link: &str) -> anyhow::Result<Option<Album>> {
         if let Some(p) = self.providers.iter().find(|p| p.url_matches(link)) {
             let info = p.get_from_url(link).await?;
@@ -52,28 +76,23 @@ impl Handler {
         query: &str,
         provider: Option<String>,
     ) -> anyhow::Result<Option<Album>> {
-        let p = match provider
-            .and_then(|id| self.providers.iter().find(|p| p.id() == id))
-            .or_else(|| self.providers.first())
-        {
-            Some(p) => p,
-            None => return Ok(None),
-        };
+        let p = self.get_provider(provider.as_deref());
         p.query_album(query).await.map(Some)
     }
 
-    async fn new() -> anyhow::Result<Self> {
-        let conn = init_db()?;
-        let providers = vec![
-            Box::new(Spotify::new().await?) as Box<dyn AlbumProvider>,
-            Box::new(Bandcamp::new()),
-        ];
-        let lastfm = Lastfm::new();
-        Ok(Handler {
-            db: sync::Mutex::new(conn),
-            providers,
-            lastfm,
-        })
+    pub async fn query_albums(
+        &self,
+        query: &str,
+        provider: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let p = self.get_provider(provider);
+        let mut choices = p.query_albums(query).await?;
+        choices.iter_mut().for_each(|(name, _)| {
+            if name.len() >= 100 {
+                *name = name[..100].to_string();
+            }
+        });
+        Ok(choices)
     }
 
     fn ensure_guild_table(&self, guild_id: u64) -> anyhow::Result<()> {
@@ -131,10 +150,10 @@ impl Handler {
                     None => bail!("Not found"),
                     Some(mut info) => {
                         let mut contents = format!(
-                            "{} - {}{}",
-                            info.name.as_deref().unwrap_or("unknown"),
-                            info.artist.as_deref().unwrap_or("unknown artist"),
+                            "{}{}\n",
+                            info.format_name(),
                             info.release_date
+                                .as_deref()
                                 .map(|d| format!(" ({})", d))
                                 .unwrap_or_default(),
                         );
@@ -143,11 +162,9 @@ impl Handler {
                                 info.genres = self.lastfm.artist_top_tags(artist).await?;
                             }
                         }
-                        if !info.genres.is_empty() {
-                            contents.push('\n');
-                            contents.push_str(&info.genres.join(", "));
+                        if let Some(genres) = info.format_genres() {
+                            _ = writeln!(&mut contents, "{}", &genres);
                         }
-                        contents.push('\n');
                         contents.push_str(info.url.as_deref().unwrap_or("no link found"));
                         Ok(Some(contents))
                     }
@@ -167,7 +184,7 @@ impl Handler {
                 )?;
                 let contents = match role {
                     Some(r) => format!("LP role changed to <@&{}>", r.id.0),
-                    None => format!("LP role removed"),
+                    None => "LP role removed".to_string(),
                 };
                 Ok(Some(contents))
             }
@@ -186,12 +203,37 @@ impl Handler {
             _ => bail!("Unknown command"),
         }
     }
+
+    async fn process_autocomplete(
+        &self,
+        ctx: &Context,
+        ac: AutocompleteInteraction,
+    ) -> anyhow::Result<()> {
+        let mut choices: Vec<(String, String)> = vec![];
+        let options = &ac.data.options;
+        match ac.data.name.as_str() {
+            "lp" => {
+                choices = self.autocomplete_lp(options).await?;
+            }
+            _ => (),
+        }
+        ac.create_autocomplete_response(&ctx.http, |r| {
+            choices.into_iter().for_each(|(name, value)| {
+                r.add_string_choice(name, value);
+            });
+            r
+        })
+        .await
+        .map_err(anyhow::Error::from)
+    }
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
+        if let Interaction::Autocomplete(ac) = interaction {
+            self.process_autocomplete(&ctx, ac).await.unwrap();
+        } else if let Interaction::ApplicationCommand(command) = interaction {
             let cmd = SlashCommand {
                 handler: self,
                 ctx: &ctx,
@@ -201,11 +243,7 @@ impl EventHandler for Handler {
                 Ok(None) => return,
                 Ok(Some(s)) => (s, InteractionApplicationCommandCallbackDataFlags::empty()),
                 Err(e) => {
-                    eprintln!(
-                        "Error processing command {}: {:?}",
-                        &command.data.name,
-                        e.to_string()
-                    );
+                    eprintln!("Error processing command {}: {:?}", &command.data.name, e);
                     (
                         e.to_string(),
                         InteractionApplicationCommandCallbackDataFlags::EPHEMERAL,
@@ -288,6 +326,7 @@ impl EventHandler for Handler {
                         .description("What you will be listening to (e.g. band - album)")
                         .kind(ApplicationCommandOptionType::String)
                         .required(true)
+                        .set_autocomplete(true)
                 })
                 .create_option(|option| {
                     option
@@ -300,6 +339,7 @@ impl EventHandler for Handler {
                         .name("link")
                         .description("Link to the album/playlist (Spotify, Youtube, Bandcamp...)")
                         .kind(ApplicationCommandOptionType::String)
+                        .set_autocomplete(true)
                 })
                 .create_option(|option| {
                     let opt = option

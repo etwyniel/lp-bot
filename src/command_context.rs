@@ -6,7 +6,8 @@ use serenity::{
         channel::{Channel, Message},
         guild::Role,
         interactions::application_command::{
-            ApplicationCommandInteraction, ApplicationCommandInteractionDataOptionValue,
+            ApplicationCommandInteraction, ApplicationCommandInteractionDataOption,
+            ApplicationCommandInteractionDataOptionValue,
         },
     },
 };
@@ -137,4 +138,22 @@ impl Responder for TextCommand<'_, '_> {
     fn handler(&self) -> &Handler {
         self.handler
     }
+}
+
+pub fn get_str_opt_ac<'a>(
+    options: &'a [ApplicationCommandInteractionDataOption],
+    name: &str,
+) -> Option<&'a str> {
+    options
+        .iter()
+        .find(|opt| opt.name == name)
+        .and_then(|opt| opt.value.as_ref())
+        .and_then(|val| val.as_str())
+}
+
+pub fn get_focused_option(options: &[ApplicationCommandInteractionDataOption]) -> Option<&str> {
+    options
+        .iter()
+        .find(|opt| opt.focused)
+        .map(|opt| opt.name.as_str())
 }

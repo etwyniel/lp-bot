@@ -23,7 +23,7 @@ impl AlbumProvider for Spotify {
     async fn get_from_url(&self, url: &str) -> anyhow::Result<Album> {
         let album_id = url
             .strip_prefix(ALBUM_URL_START)
-            .ok_or(anyhow!("Invalid URL for a spotify album"))?
+            .ok_or_else(|| anyhow!("Invalid URL for a spotify album"))?
             .split('?')
             .next()
             .unwrap();
@@ -70,11 +70,40 @@ impl AlbumProvider for Spotify {
             Err(anyhow!("Not an album"))
         }
     }
+
+    async fn query_albums(&self, query: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let res = self
+            .client
+            .search(query, &SearchType::Album, None, None, Some(10), None)
+            .await?;
+        if let rspotify::model::SearchResult::Albums(albums) = res {
+            Ok(albums
+                .items
+                .into_iter()
+                .map(|a| {
+                    (
+                        format!(
+                            "{} - {}",
+                            a.artists
+                                .into_iter()
+                                .next()
+                                .map(|ar| ar.name)
+                                .unwrap_or_default(),
+                            a.name,
+                        ),
+                        a.id.map(|id| id.url()).unwrap_or_default(),
+                    )
+                })
+                .collect())
+        } else {
+            Err(anyhow!("Not an album"))
+        }
+    }
 }
 
 impl Spotify {
     pub async fn new() -> anyhow::Result<Self> {
-        let creds = Credentials::from_env().ok_or(anyhow!("No spotify credentials"))?;
+        let creds = Credentials::from_env().ok_or_else(|| anyhow!("No spotify credentials"))?;
         let config = Config {
             token_refreshing: true,
             ..Default::default()
