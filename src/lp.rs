@@ -98,7 +98,7 @@ pub async fn run_lp<T: Responder>(
     }
     let handler = responder.handler();
     let mut info = match (&lp_name, &link) {
-        (Some(name), None) => handler.lookup_album(name, provider).await?,
+        (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
         (None, Some(lnk)) => handler.get_album_info(lnk).await?,
         (None, None) => bail!("Please specify something to LP"),
         (Some(_), Some(_)) => None,
@@ -135,22 +135,6 @@ pub async fn run_lp<T: Responder>(
 }
 
 impl Handler {
-    pub fn get_create_threads(&self, guild_id: u64) -> bool {
-        let db = self.db.lock().unwrap();
-        db.query_row(
-            "SELECT create_threads FROM guild WHERE id = ?1",
-            [guild_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false)
-    }
-
-    pub fn get_role_id(&self, guild_id: u64) -> Option<u64> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT role_id FROM guild WHERE id = ?1").ok()?;
-        stmt.query_row([guild_id], |row| row.get(0)).ok()
-    }
-
     pub async fn autocomplete_lp(
         &self,
         options: &[ApplicationCommandInteractionDataOption],

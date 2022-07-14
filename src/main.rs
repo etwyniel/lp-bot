@@ -2,10 +2,11 @@ use std::fmt::Write;
 use std::{env, sync};
 
 use album::Album;
-use anyhow::bail;
-use command_context::TextCommand;
+use anyhow::{anyhow, bail};
+use command_context::{Responder, TextCommand};
 use lastfm::Lastfm;
 use rusqlite::{params, Connection};
+use serenity::model::interactions::application_command::ApplicationCommandType;
 use serenity::model::interactions::autocomplete::AutocompleteInteraction;
 use serenity::{
     async_trait,
@@ -22,17 +23,19 @@ use serenity::{
     },
     prelude::*,
 };
-use spotify::Spotify;
 mod album;
 mod bandcamp;
 mod command_context;
+mod db;
 mod lastfm;
 mod lp;
 mod reltime;
 mod spotify;
 
-use crate::{album::AlbumProvider, command_context::SlashCommand};
+use album::AlbumProvider;
 use bandcamp::Bandcamp;
+use command_context::SlashCommand;
+use spotify::Spotify;
 
 pub struct Handler {
     db: sync::Mutex<Connection>,
@@ -42,7 +45,7 @@ pub struct Handler {
 
 impl Handler {
     async fn new() -> anyhow::Result<Self> {
-        let conn = init_db()?;
+        let conn = db::init()?;
         let providers = vec![
             Box::new(Spotify::new().await?) as Box<dyn AlbumProvider>,
             Box::new(Bandcamp::new()),
@@ -74,9 +77,9 @@ impl Handler {
     pub async fn lookup_album(
         &self,
         query: &str,
-        provider: Option<String>,
+        provider: Option<&str>,
     ) -> anyhow::Result<Option<Album>> {
-        let p = self.get_provider(provider.as_deref());
+        let p = self.get_provider(provider);
         p.query_album(query).await.map(Some)
     }
 
@@ -93,15 +96,6 @@ impl Handler {
             }
         });
         Ok(choices)
-    }
-
-    fn ensure_guild_table(&self, guild_id: u64) -> anyhow::Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO guild (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
-            [guild_id],
-        )?;
-        Ok(())
     }
 
     fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
@@ -146,7 +140,7 @@ impl Handler {
             "album" => {
                 let album_query = cmd.str_opt("album").unwrap();
                 let provider = cmd.str_opt("provider");
-                match self.lookup_album(&album_query, provider).await? {
+                match self.lookup_album(&album_query, provider.as_deref()).await? {
                     None => bail!("Not found"),
                     Some(mut info) => {
                         let mut contents = format!(
@@ -199,6 +193,47 @@ impl Handler {
                     if b == Some(true) { "" } else { "not " }
                 );
                 Ok(Some(contents))
+            }
+            "quote" => {
+                let guild_id = cmd
+                    .command
+                    .guild_id
+                    .ok_or_else(|| anyhow!("Must be run in a server"))?
+                    .0;
+                if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
+                    let quote_number = self.add_quote(guild_id, &message)?;
+                    Ok(Some(format!("Quote saved as #{}", quote_number)))
+                } else {
+                    let quote = if let Some(quote_number) = cmd.int_opt("number") {
+                        self.fetch_quote(guild_id, quote_number as u64)?
+                    } else {
+                        self.get_random_quote(guild_id)?
+                    }
+                    .ok_or_else(|| anyhow!("No such quote"))?;
+                    let message_url = format!(
+                        "https://discord.com/channels/{}/{}/{}",
+                        quote.guild_id, quote.channel_id, quote.message_id
+                    );
+                    let contents = format!(
+                        "{}\n - <@{}> [(Source)]({})",
+                        &quote.contents, quote.author_id, message_url
+                    );
+                    cmd.command
+                        .create_interaction_response(&cmd.ctx.http, |resp| {
+                            resp.kind(InteractionResponseType::ChannelMessageWithSource)
+                                .interaction_response_data(|data| {
+                                    data.embed(|embed| {
+                                        embed
+                                            .author(|a| a.name(format!("#{}", quote.quote_number)))
+                                            .description(&contents)
+                                            .url(message_url)
+                                            .timestamp(quote.ts.format("%+").to_string())
+                                    })
+                                })
+                        })
+                        .await?;
+                    Ok(None)
+                }
             }
             _ => bail!("Unknown command"),
         }
@@ -276,6 +311,32 @@ impl EventHandler for Handler {
         };
         if let Err(e) = text_command.run_lp().await {
             eprintln!("Failed to start LP from text command: {}", e);
+        }
+    }
+
+    async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
+        if add_reaction.emoji.unicode_eq("🗨️") {
+            if let Some(id) = add_reaction.guild_id {
+                let message = match add_reaction.message(&ctx.http).await {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                let text_command = TextCommand {
+                    ctx: &ctx,
+                    handler: self,
+                    message: &message,
+                };
+                match self.add_quote(id.0, &message) {
+                    Ok(number) => {
+                        text_command
+                            .respond(&format!("Quote saved as #{}", number), None)
+                            .await
+                            .err()
+                            .map(|e| eprintln!("error saving quote: {}", e));
+                    }
+                    Err(_) => (),
+                }
+            }
         }
     }
 
@@ -407,20 +468,26 @@ impl EventHandler for Handler {
         })
         .await
         .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command.name("quote").kind(ApplicationCommandType::Message)
+        })
+        .await
+        .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command
+                .name("quote")
+                .description("Retrieve a quote")
+                .create_option(|option| {
+                    option
+                        .name("number")
+                        .description("Number the quote was saved as (optional)")
+                        .kind(ApplicationCommandOptionType::Integer)
+                        .min_int_value(1)
+                })
+        })
+        .await
+        .unwrap();
     }
-}
-
-fn init_db() -> anyhow::Result<Connection> {
-    let conn = Connection::open("lpbot.sqlite")?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS guild (
-            id INTEGER PRIMARY KEY,
-            role_id INTEGER,
-            create_threads BOOLEAN NOT NULL DEFAULT(TRUE)
-        )",
-        [],
-    )?;
-    Ok(conn)
 }
 
 #[tokio::main]
@@ -443,11 +510,16 @@ async fn main() {
         .expect("application id is not a valid id");
 
     // Build our client.
-    let mut client = Client::builder(token, GatewayIntents::GUILD_MESSAGES)
-        .event_handler(handler)
-        .application_id(application_id)
-        .await
-        .expect("Error creating client");
+    let mut client = Client::builder(
+        token,
+        GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS,
+    )
+    .event_handler(handler)
+    .application_id(application_id)
+    .await
+    .expect("Error creating client");
 
     // Finally, start a single shard, and start listening to events.
     //

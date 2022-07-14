@@ -107,6 +107,16 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             }
         })
     }
+
+    pub fn int_opt(&self, name: &str) -> Option<i64> {
+        self.opt(name, |o| {
+            if let ApplicationCommandInteractionDataOptionValue::Integer(i) = o {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 pub struct TextCommand<'a, 'b> {
