@@ -3,9 +3,11 @@ use std::{env, sync};
 
 use album::Album;
 use anyhow::{anyhow, bail};
-use command_context::{Responder, TextCommand};
+use command_context::TextCommand;
 use lastfm::Lastfm;
 use rusqlite::{params, Connection};
+use serenity::futures::TryFutureExt;
+use serenity::model::channel::{Channel, ChannelType, ReactionType};
 use serenity::model::interactions::application_command::ApplicationCommandType;
 use serenity::model::interactions::autocomplete::AutocompleteInteraction;
 use serenity::{
@@ -201,8 +203,9 @@ impl Handler {
                     .ok_or_else(|| anyhow!("Must be run in a server"))?
                     .0;
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
-                    let quote_number = self.add_quote(guild_id, &message)?;
-                    Ok(Some(format!("Quote saved as #{}", quote_number)))
+                    let quote_number = self.add_quote(guild_id, message)?;
+                    let link = message.id.link(message.channel_id, Some(GuildId(guild_id)));
+                    Ok(Some(format!("Quote saved as #{}: {}", quote_number, link)))
                 } else {
                     let quote = if let Some(quote_number) = cmd.int_opt("number") {
                         self.fetch_quote(guild_id, quote_number as u64)?
@@ -301,6 +304,27 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
+        let channel = match new_message.channel(&ctx.http).await {
+            Ok(chan) => chan,
+            Err(e) => {
+                eprintln!("{}", e);
+                return;
+            }
+        };
+        let is_thread = channel
+            .guild()
+            .map(|g| g.kind == ChannelType::PublicThread)
+            .unwrap_or(false);
+        if new_message.content.starts_with(".qp") && is_thread {
+            if let Err(e) = new_message
+                .react(&ctx.http, ReactionType::Unicode("✅".to_string()))
+                .and_then(|_| new_message.react(&ctx.http, ReactionType::Unicode("❎".to_string())))
+                .await
+            {
+                eprintln!("Error adding reactions: {}", e);
+            }
+            return;
+        }
         if !new_message.mentions_me(&ctx.http).await.unwrap() || new_message.author.bot {
             return;
         }
@@ -315,27 +339,23 @@ impl EventHandler for Handler {
     }
 
     async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
-        if add_reaction.emoji.unicode_eq("🗨️") {
-            if let Some(id) = add_reaction.guild_id {
-                let message = match add_reaction.message(&ctx.http).await {
-                    Ok(m) => m,
-                    Err(_) => return,
-                };
-                let text_command = TextCommand {
-                    ctx: &ctx,
-                    handler: self,
-                    message: &message,
-                };
-                match self.add_quote(id.0, &message) {
-                    Ok(number) => {
-                        text_command
-                            .respond(&format!("Quote saved as #{}", number), None)
-                            .await
-                            .err()
-                            .map(|e| eprintln!("error saving quote: {}", e));
-                    }
-                    Err(_) => (),
-                }
+        if !add_reaction.emoji.unicode_eq("🗨️") {
+            return;
+        }
+        if let Some(id) = add_reaction.guild_id {
+            let message = match add_reaction.message(&ctx.http).await {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let number = self.add_quote(id.0, &message).unwrap();
+            if let Ok(Channel::Guild(g)) = add_reaction.channel(&ctx.http).await {
+                g.send_message(&ctx.http, |m| {
+                    m.reference_message((g.id, message.id))
+                        .allowed_mentions(|mentions| mentions.empty_users())
+                        .content(&format!("Quote saved as #{}", number))
+                })
+                .await
+                .unwrap();
             }
         }
     }
@@ -513,8 +533,8 @@ async fn main() {
     let mut client = Client::builder(
         token,
         GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT
-            | GatewayIntents::GUILD_MESSAGE_REACTIONS,
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS
+            | GatewayIntents::MESSAGE_CONTENT,
     )
     .event_handler(handler)
     .application_id(application_id)
