@@ -3,9 +3,8 @@ use std::{env, sync};
 
 use album::Album;
 use anyhow::{anyhow, bail};
-use command_context::TextCommand;
 use lastfm::Lastfm;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serenity::futures::TryFutureExt;
 use serenity::model::channel::{Channel, ChannelType, ReactionType};
 use serenity::model::interactions::application_command::ApplicationCommandType;
@@ -105,13 +104,7 @@ impl Handler {
             Some(id) => id,
             None => bail!("Must be run in a server"),
         };
-        self.ensure_guild_table(guild_id)?;
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "UPDATE guild SET role_id = ?1 WHERE id = ?2",
-            params![role_id, guild_id],
-        )?;
-        Ok(())
+        self.set_guild_field("role_id", guild_id, role_id)
     }
 
     fn set_should_create_threads(&self, guild_id: Option<u64>, create: bool) -> anyhow::Result<()> {
@@ -119,16 +112,22 @@ impl Handler {
             Some(id) => id,
             None => bail!("Must be run in a server"),
         };
-        self.ensure_guild_table(guild_id)?;
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "UPDATE guild SET create_threads = ?1 WHERE id = ?2",
-            params![create, guild_id],
-        )?;
-        Ok(())
+        self.set_guild_field("create_threads", guild_id, create)
+    }
+
+    fn set_webhook(&self, guild_id: Option<u64>, webhook: Option<&str>) -> anyhow::Result<()> {
+        let guild_id = match guild_id {
+            Some(id) => id,
+            None => bail!("Must be run in a server"),
+        };
+        self.set_guild_field("webhook", guild_id, webhook)
     }
 
     async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<Option<String>> {
+        let guild_id = cmd
+            .command
+            .guild_id
+            .ok_or_else(|| anyhow!("Must be run in a server"))?;
         match cmd.name() {
             "lp" => {
                 let lp_name = cmd.str_opt("album");
@@ -193,6 +192,15 @@ impl Handler {
                 let contents = format!(
                     "LPBot will {}create threads for listening parties",
                     if b == Some(true) { "" } else { "not " }
+                );
+                Ok(Some(contents))
+            }
+            "setwebhook" => {
+                let wh = cmd.str_opt("webhook");
+                self.set_webhook(Some(guild_id.0), wh.as_deref())?;
+                let contents = format!(
+                    "LPBot will {}use a webhook",
+                    if wh.is_some() { "" } else { "not " }
                 );
                 Ok(Some(contents))
             }
@@ -328,14 +336,6 @@ impl EventHandler for Handler {
         if !new_message.mentions_me(&ctx.http).await.unwrap() || new_message.author.bot {
             return;
         }
-        let text_command = TextCommand {
-            ctx: &ctx,
-            handler: self,
-            message: &new_message,
-        };
-        if let Err(e) = text_command.run_lp().await {
-            eprintln!("Failed to start LP from text command: {}", e);
-        }
     }
 
     async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
@@ -370,6 +370,12 @@ impl EventHandler for Handler {
                 .expect("GUILD_ID must be an integer"),
         );
 
+        let providers = self
+            .providers
+            .iter()
+            .map(|p| p.id())
+            .take(25)
+            .collect::<Vec<_>>();
         GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
             commands
                 .create_application_command(|command| {
@@ -391,12 +397,6 @@ impl EventHandler for Handler {
         .await
         .unwrap();
 
-        let providers = self
-            .providers
-            .iter()
-            .map(|p| p.id())
-            .take(25)
-            .collect::<Vec<_>>();
         ApplicationCommand::create_global_application_command(&ctx.http, |command| {
             command
                 .name("lp")
@@ -504,6 +504,22 @@ impl EventHandler for Handler {
                         .kind(ApplicationCommandOptionType::Integer)
                         .min_int_value(1)
                 })
+        })
+        .await
+        .unwrap();
+        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
+            command
+                .name("setwebhook")
+                .description(
+                    "Set (or unset) a webhook for LPBot to use when creating listening parties",
+                )
+                .create_option(|option| {
+                    option
+                        .name("webhook")
+                        .description("The webhook URL (leave empty to remove)")
+                        .kind(ApplicationCommandOptionType::String)
+                })
+                .default_member_permissions(Permissions::MANAGE_WEBHOOKS)
         })
         .await
         .unwrap();

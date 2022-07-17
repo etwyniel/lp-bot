@@ -4,24 +4,20 @@ use std::ops::Add;
 use anyhow::bail;
 use chrono::{prelude::*, Duration};
 use regex::Regex;
-use serde_json::Map;
+use serenity::model::channel::ChannelType;
 use serenity::model::interactions::application_command::ApplicationCommandInteractionDataOption;
-use serenity::{builder::CreateThread, model::channel::ChannelType};
 
 use crate::album::Album;
 use crate::command_context::{get_focused_option, get_str_opt_ac, Responder};
-use crate::{
-    command_context::{SlashCommand, TextCommand},
-    Handler,
-};
+use crate::{command_context::SlashCommand, Handler};
 
 fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     let time = match time {
         Some("now") | None => return Ok("now".to_string()),
         Some(t) => t,
     };
-    let xx_re = Regex::new("(?i)(XX:?)?([0-5][0-9])")?;
-    let plus_re = Regex::new(r"\+(([0-5])?[0-9])")?;
+    let xx_re = Regex::new("(?i)(XX:?)?([0-5][0-9])")?; // e.g. XX:15, xx15 or 15
+    let plus_re = Regex::new(r"\+(([0-5])?[0-9])")?; // e.g. +25
     let mut lp_time = Utc::now();
     if let Some(cap) = xx_re.captures(time) {
         let min: i64 = cap.get(2).unwrap().as_str().parse()?;
@@ -42,6 +38,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         bail!("Invalid time {}", time);
     }
 
+    // timestamp and relative time
     Ok(format!("at <t:{0:}:t> (<t:{0:}:R>)", lp_time.timestamp()))
 }
 
@@ -53,20 +50,20 @@ async fn build_message_contents(
 ) -> anyhow::Result<String> {
     let when = convert_lp_time(time)?;
     let lp_name = info.format_name();
-    if info.genres.is_empty() {
-        if let Some(artist) = &info.artist {
-            info.genres = match handler.lastfm.artist_top_tags(artist).await {
-                Ok(genres) => genres,
-                Err(err) => {
-                    eprintln!("Couldn't retrieve genres from lastfm: {}", err);
-                    vec![]
-                }
-            };
-        }
+    if let (true, Some(artist)) = (info.genres.is_empty(), &info.artist) {
+        // No genres, try to get some from last.fm
+        info.genres = match handler.lastfm.artist_top_tags(artist).await {
+            Ok(genres) => genres,
+            Err(err) => {
+                // Log error but carry on
+                eprintln!("Couldn't retrieve genres from lastfm: {}", err);
+                vec![]
+            }
+        };
     }
     let mut resp_content = format!(
         "{} {} {}\n",
-        role_id
+        role_id // mention role if set
             .map(|id| format!("<@&{}>", id))
             .unwrap_or_else(|| "Listening party: ".to_string()),
         lp_name,
@@ -81,57 +78,94 @@ async fn build_message_contents(
     Ok(resp_content)
 }
 
-pub async fn run_lp<T: Responder>(
-    responder: &T,
-    guild_id: u64,
-    mut lp_name: Option<String>,
-    time: Option<String>,
-    mut link: Option<String>,
-    provider: Option<String>,
-) -> anyhow::Result<()> {
-    if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
-        // As a special case for convenience, if we have a URL in lp_name, use that as link
-        if link.is_some() && link != lp_name {
-            bail!("Too many links!");
+impl<'a, 'b> SlashCommand<'a, 'b> {
+    pub async fn run_lp(
+        &self,
+        mut lp_name: Option<String>,
+        mut link: Option<String>,
+        time: Option<String>,
+        provider: Option<String>,
+    ) -> anyhow::Result<()> {
+        if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
+            // As a special case for convenience, if we have a URL in lp_name, use that as link
+            if link.is_some() && link != lp_name {
+                bail!("Too many links!");
+            }
+            link = lp_name.take();
         }
-        link = lp_name.take();
-    }
-    let handler = responder.handler();
-    let mut info = match (&lp_name, &link) {
-        (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
-        (None, Some(lnk)) => handler.get_album_info(lnk).await?,
-        (None, None) => bail!("Please specify something to LP"),
-        (Some(_), Some(_)) => None,
-    }
-    .unwrap_or_else(|| Album {
-        name: lp_name,
-        url: link,
-        ..Default::default()
-    });
-    let role_id = handler.get_role_id(guild_id);
-    let resp_content = build_message_contents(handler, &mut info, time.as_deref(), role_id).await?;
-    let message = responder.respond(&resp_content, role_id).await?;
-    let http = &responder.ctx().http;
-    if handler.get_create_threads(guild_id) {
-        let chan = message.channel(http).await?;
-        let thread_name = info.name.as_deref().unwrap_or("Listening party");
-        if let Some((ChannelType::PublicThread, c)) = chan.guild().map(|c| (c.kind, c)) {
-            if c.kind == ChannelType::PublicThread {
+        let handler = self.handler;
+        let http = &self.ctx.http;
+        // Depending on what we have, look up more information
+        let mut info = match (&lp_name, &link) {
+            (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
+            (None, Some(lnk)) => handler.get_album_info(lnk).await?,
+            (None, None) => bail!("Please specify something to LP"),
+            (Some(_), Some(_)) => None,
+        }
+        .unwrap_or_else(|| Album {
+            name: lp_name,
+            url: link,
+            ..Default::default()
+        });
+
+        let guild_id = self.command.guild_id.unwrap().0;
+        let role_id = handler.get_role_id(guild_id);
+        let resp_content =
+            build_message_contents(handler, &mut info, time.as_deref(), role_id).await?;
+        let webhook = handler.get_webhook(guild_id);
+        let message = if let Some(url) = webhook.as_deref() {
+            // Send LP message through webhook
+            // This lets us impersonate the user who sent the command
+            let wh = http.get_webhook_from_url(url).await?;
+            let user = &self.command.user;
+            let avatar_url = user.avatar_url();
+            let nick = user // try to get the user's nickname
+                .nick_in(http, guild_id)
+                .await
+                .unwrap_or_else(|| user.name.clone());
+            wh.execute(http, true, |msg| {
+                msg.content(&resp_content)
+                    .allowed_mentions(|mentions| mentions.roles(role_id))
+                    .username(nick);
+                avatar_url.map(|url| msg.avatar_url(url));
+                msg
+            })
+            .await?
+            .unwrap() // Message is present because we set wait to true in execute
+        } else {
+            // Create interaction response
+            self.respond(&resp_content, role_id).await?
+        };
+        let mut response = format!(
+            "LP created: {}",
+            message.id.link(message.channel_id, self.command.guild_id)
+        );
+        if handler.get_create_threads(guild_id) {
+            let chan = message.channel(http).await?;
+            let thread_name = info.name.as_deref().unwrap_or("Listening party");
+            let guild_chan = chan.guild().map(|c| (c.kind, c));
+            if let (None, Some((ChannelType::PublicThread, c))) = (&webhook, &guild_chan) {
+                // If we're already in a thread, just rename it
                 c.edit_thread(http, |t| t.name(&thread_name)).await?;
-                return Ok(());
+            } else if let Some((ChannelType::Text, c)) = &guild_chan {
+                // Create thread from response message
+                let thread = c
+                    .create_public_thread(http, message.id, |thread| {
+                        thread
+                            .name(thread_name)
+                            .kind(ChannelType::PublicThread)
+                            .auto_archive_duration(60)
+                    })
+                    .await?;
+                response = format!("LP created: <#{}>", thread.id.as_u64());
             }
         }
-        // Create thread from response message
-        let mut thread = CreateThread::default();
-        thread
-            .name(thread_name)
-            .kind(ChannelType::PublicThread)
-            .auto_archive_duration(60);
-        let map = Map::from_iter(thread.0.into_iter().map(|(k, v)| (k.to_string(), v)));
-        http.create_public_thread(message.channel_id.0, message.id.0, &map)
-            .await?;
+        if webhook.is_some() {
+            // If we used a webhook, we still need to create the interaction response
+            self.respond(&response, None).await?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 impl Handler {
@@ -145,7 +179,9 @@ impl Handler {
         let mut album = get_str_opt_ac(options, "album");
         if let (Some(mut s), Some("album")) = (&mut album, focused) {
             if s.len() >= 7 && !s.starts_with("https://") {
+                // if url, don't complete
                 if let (None, Some(stripped)) = (&provider, s.strip_prefix("bc:")) {
+                    // as a shorthand, search bandcamp for values with the prefix "bc:"
                     s = stripped;
                     provider = Some("bandcamp");
                 }
@@ -161,65 +197,5 @@ impl Handler {
             }
         }
         Ok(choices)
-    }
-}
-
-impl TextCommand<'_, '_> {
-    pub async fn run_lp(&self) -> anyhow::Result<()> {
-        let mut msg: &str = &self.message.content;
-        // Remove mentions from message
-        let mut no_mentions = String::new();
-        while !msg.is_empty() {
-            let end = if let Some(ndx) = msg.find("<@") {
-                ndx
-            } else {
-                msg.len()
-            };
-            no_mentions.push_str(&msg[..end]);
-            msg = &msg[end..];
-            if let Some(end) = msg.find('>') {
-                msg = &msg[(end + 1)..];
-            }
-        }
-        no_mentions = no_mentions.trim().to_string();
-
-        // Extract time if present
-        let mut lp_name = Some(no_mentions.clone());
-        let mut time = None;
-        let time_re = Regex::new(r"(?i)(.*?)\s+(at *)?XX:?([0-5]?[0-9])\s*$")?;
-        if let Some(cap) = time_re.captures(&no_mentions) {
-            lp_name = Some(cap.get(1).unwrap().as_str().to_string());
-            time = Some(cap.get(3).unwrap().as_str().to_string())
-        }
-
-        run_lp(
-            self,
-            self.message.guild_id.unwrap().0,
-            lp_name,
-            time,
-            None,
-            None,
-        )
-        .await
-    }
-}
-
-impl<'a, 'b> SlashCommand<'a, 'b> {
-    pub async fn run_lp(
-        &self,
-        subject: Option<String>,
-        time: Option<String>,
-        link: Option<String>,
-        provider: Option<String>,
-    ) -> anyhow::Result<()> {
-        run_lp(
-            self,
-            self.command.guild_id.unwrap().0,
-            subject,
-            link,
-            time,
-            provider,
-        )
-        .await
     }
 }

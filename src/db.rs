@@ -1,7 +1,7 @@
 use anyhow::bail;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fallible_iterator::FallibleIterator;
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::FromSql, Connection, ToSql};
 use serenity::model::{channel::Message, id::MessageId};
 
 use crate::Handler;
@@ -27,20 +27,42 @@ impl Handler {
         Ok(())
     }
 
-    pub fn get_create_threads(&self, guild_id: u64) -> bool {
+    pub fn get_guild_field<T: FromSql>(&self, field: &str, guild_id: u64) -> Option<T> {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT create_threads FROM guild WHERE id = ?1",
+            &format!("SELECT {} FROM guild WHERE id = ?1", field),
             [guild_id],
             |row| row.get(0),
         )
-        .unwrap_or(false)
+        .ok()
+    }
+
+    pub fn set_guild_field<T: ToSql>(
+        &self,
+        field: &str,
+        guild_id: u64,
+        value: T,
+    ) -> anyhow::Result<()> {
+        self.ensure_guild_table(guild_id)?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            &format!("UPDATE guild SET {} = ?2 WHERE id = ?1", field),
+            params![guild_id, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_create_threads(&self, guild_id: u64) -> bool {
+        self.get_guild_field("create_threads", guild_id)
+            .unwrap_or(false)
     }
 
     pub fn get_role_id(&self, guild_id: u64) -> Option<u64> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT role_id FROM guild WHERE id = ?1").ok()?;
-        stmt.query_row([guild_id], |row| row.get(0)).ok()
+        self.get_guild_field("role_id", guild_id)
+    }
+
+    pub fn get_webhook(&self, guild_id: u64) -> Option<String> {
+        self.get_guild_field("webhook", guild_id)
     }
 
     pub fn add_quote(&self, guild_id: u64, message: &Message) -> anyhow::Result<u64> {
@@ -124,7 +146,8 @@ pub fn init() -> anyhow::Result<Connection> {
         "CREATE TABLE IF NOT EXISTS guild (
             id INTEGER PRIMARY KEY,
             role_id INTEGER,
-            create_threads BOOLEAN NOT NULL DEFAULT(TRUE)
+            create_threads BOOLEAN NOT NULL DEFAULT(TRUE),
+            webhook STRING
         )",
         [],
     )?;
