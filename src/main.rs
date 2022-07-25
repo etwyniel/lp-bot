@@ -5,14 +5,12 @@ use album::Album;
 use anyhow::{anyhow, bail};
 use lastfm::Lastfm;
 use rusqlite::Connection;
-use serenity::futures::TryFutureExt;
-use serenity::model::channel::{Channel, ChannelType, ReactionType};
+use serenity::model::channel::Channel;
 use serenity::model::interactions::application_command::ApplicationCommandType;
 use serenity::model::interactions::autocomplete::AutocompleteInteraction;
 use serenity::{
     async_trait,
     model::{
-        channel::Message,
         gateway::GatewayIntents,
         gateway::Ready,
         id::GuildId,
@@ -213,7 +211,11 @@ impl Handler {
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
                     let quote_number = self.add_quote(guild_id, message)?;
                     let link = message.id.link(message.channel_id, Some(GuildId(guild_id)));
-                    Ok(Some(format!("Quote saved as #{}: {}", quote_number, link)))
+                    let resp_text = match quote_number {
+                        Some(n) => format!("Quote saved as #{}: {}", n, link),
+                        None => "Quote already added".to_string(),
+                    };
+                    Ok(Some(resp_text))
                 } else {
                     let quote = if let Some(quote_number) = cmd.int_opt("number") {
                         self.fetch_quote(guild_id, quote_number as u64)?
@@ -311,33 +313,6 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn message(&self, ctx: Context, new_message: Message) {
-        let channel = match new_message.channel(&ctx.http).await {
-            Ok(chan) => chan,
-            Err(e) => {
-                eprintln!("{}", e);
-                return;
-            }
-        };
-        let is_thread = channel
-            .guild()
-            .map(|g| g.kind == ChannelType::PublicThread)
-            .unwrap_or(false);
-        if new_message.content.starts_with(".qp") && is_thread {
-            if let Err(e) = new_message
-                .react(&ctx.http, ReactionType::Unicode("✅".to_string()))
-                .and_then(|_| new_message.react(&ctx.http, ReactionType::Unicode("❎".to_string())))
-                .await
-            {
-                eprintln!("Error adding reactions: {}", e);
-            }
-            return;
-        }
-        if !new_message.mentions_me(&ctx.http).await.unwrap() || new_message.author.bot {
-            return;
-        }
-    }
-
     async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
         if !add_reaction.emoji.unicode_eq("🗨️") {
             return;
@@ -347,7 +322,14 @@ impl EventHandler for Handler {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let number = self.add_quote(id.0, &message).unwrap();
+            let number = match self.add_quote(id.0, &message) {
+                Ok(Some(n)) => n,
+                Ok(None) => return,
+                Err(e) => {
+                    eprintln!("Error adding quote: {}", e);
+                    return;
+                }
+            };
             if let Ok(Channel::Guild(g)) = add_reaction.channel(&ctx.http).await {
                 g.send_message(&ctx.http, |m| {
                     m.reference_message((g.id, message.id))
@@ -404,7 +386,7 @@ impl EventHandler for Handler {
                 .create_option(|option| {
                     option
                         .name("album")
-                        .description("What you will be listening to (e.g. band - album)")
+                        .description("What you will be listening to (e.g. band - album, spotify/bandcamp link)")
                         .kind(ApplicationCommandOptionType::String)
                         .required(true)
                         .set_autocomplete(true)
@@ -418,7 +400,7 @@ impl EventHandler for Handler {
                 .create_option(|option| {
                     option
                         .name("link")
-                        .description("Link to the album/playlist (Spotify, Youtube, Bandcamp...)")
+                        .description("(Optional) Link to the album/playlist (Spotify, Youtube, Bandcamp...)")
                         .kind(ApplicationCommandOptionType::String)
                         .set_autocomplete(true)
                 })

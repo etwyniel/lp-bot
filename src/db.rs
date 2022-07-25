@@ -1,7 +1,7 @@
 use anyhow::bail;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fallible_iterator::FallibleIterator;
-use rusqlite::{params, types::FromSql, Connection, ToSql};
+use rusqlite::{params, types::FromSql, Connection, Error::SqliteFailure, ErrorCode, ToSql};
 use serenity::model::{channel::Message, id::MessageId};
 
 use crate::Handler;
@@ -65,7 +65,7 @@ impl Handler {
         self.get_guild_field("webhook", guild_id)
     }
 
-    pub fn add_quote(&self, guild_id: u64, message: &Message) -> anyhow::Result<u64> {
+    pub fn add_quote(&self, guild_id: u64, message: &Message) -> anyhow::Result<Option<u64>> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let last_quote: u64 = tx
@@ -79,7 +79,7 @@ impl Handler {
         let ts = message.timestamp;
         let author_id = message.author.id.0;
         let author_name = &message.author.name;
-        tx.execute(
+        match tx.execute(
             r"INSERT INTO quote (
     guild_id, channel_id, message_id, ts, quote_number,
     author_id, author_name, contents
@@ -94,9 +94,15 @@ impl Handler {
                 author_name,
                 &message.content
             ],
-        )?;
+        ) {
+            Err(SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
+                return Ok(None); // Quote already exists
+            }
+            Ok(n) => Ok(Some(n)),
+            Err(e) => Err(e),
+        }?;
         tx.commit()?;
-        Ok(last_quote + 1)
+        Ok(Some(last_quote + 1))
     }
 
     pub fn fetch_quote(&self, guild_id: u64, quote_number: u64) -> anyhow::Result<Option<Quote>> {

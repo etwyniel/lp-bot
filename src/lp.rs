@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::ops::Add;
 
@@ -16,7 +17,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         Some("now") | None => return Ok("now".to_string()),
         Some(t) => t,
     };
-    let xx_re = Regex::new("(?i)(XX:?)?([0-5][0-9])")?; // e.g. XX:15, xx15 or 15
+    let xx_re = Regex::new("(?i)^(XX:?)?([0-5][0-9])$")?; // e.g. XX:15, xx15 or 15
     let plus_re = Regex::new(r"\+(([0-5])?[0-9])")?; // e.g. +25
     let mut lp_time = Utc::now();
     if let Some(cap) = xx_re.captures(time) {
@@ -52,14 +53,13 @@ async fn build_message_contents(
     let lp_name = info.format_name();
     if let (true, Some(artist)) = (info.genres.is_empty(), &info.artist) {
         // No genres, try to get some from last.fm
-        info.genres = match handler.lastfm.artist_top_tags(artist).await {
-            Ok(genres) => genres,
+        match handler.lastfm.artist_top_tags(artist).await {
+            Ok(genres) => info.genres = genres,
             Err(err) => {
                 // Log error but carry on
                 eprintln!("Couldn't retrieve genres from lastfm: {}", err);
-                vec![]
             }
-        };
+        }
     }
     let mut resp_content = format!(
         "{} {} {}\n",
@@ -98,9 +98,14 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         // Depending on what we have, look up more information
         let mut info = match (&lp_name, &link) {
             (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
-            (None, Some(lnk)) => handler.get_album_info(lnk).await?,
+            (name, Some(lnk)) => {
+                let mut info = handler.get_album_info(lnk).await?;
+                if let Some((info, name)) = info.as_mut().zip(name.clone()) {
+                    info.name = Some(name)
+                };
+                info
+            }
             (None, None) => bail!("Please specify something to LP"),
-            (Some(_), Some(_)) => None,
         }
         .unwrap_or_else(|| Album {
             name: lp_name,
@@ -122,7 +127,8 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             let nick = user // try to get the user's nickname
                 .nick_in(http, guild_id)
                 .await
-                .unwrap_or_else(|| user.name.clone());
+                .map(Cow::Owned)
+                .unwrap_or_else(|| Cow::Borrowed(&user.name));
             wh.execute(http, true, |msg| {
                 msg.content(&resp_content)
                     .allowed_mentions(|mentions| mentions.roles(role_id))
@@ -141,11 +147,13 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             message.id.link(message.channel_id, self.command.guild_id)
         );
         if handler.get_create_threads(guild_id) {
+            // Create a thread from the response message for the LP to take place in
             let chan = message.channel(http).await?;
             let thread_name = info.name.as_deref().unwrap_or("Listening party");
             let guild_chan = chan.guild().map(|c| (c.kind, c));
             if let (None, Some((ChannelType::PublicThread, c))) = (&webhook, &guild_chan) {
                 // If we're already in a thread, just rename it
+                // unless we are using a webhook, in which case we can create a new thread
                 c.edit_thread(http, |t| t.name(&thread_name)).await?;
             } else if let Some((ChannelType::Text, c)) = &guild_chan {
                 // Create thread from response message
