@@ -18,7 +18,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         Some(t) => t,
     };
     let xx_re = Regex::new("(?i)^(XX:?)?([0-5][0-9])$")?; // e.g. XX:15, xx15 or 15
-    let plus_re = Regex::new(r"\+(([0-5])?[0-9])")?; // e.g. +25
+    let plus_re = Regex::new(r"\+?(([0-5])?[0-9])m?")?; // e.g. +25
     let mut lp_time = Utc::now();
     if let Some(cap) = xx_re.captures(time) {
         let min: i64 = cap.get(2).unwrap().as_str().parse()?;
@@ -43,24 +43,31 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     Ok(format!("at <t:{0:}:t> (<t:{0:}:R>)", lp_time.timestamp()))
 }
 
+async fn get_lastfm_genres(handler: &Handler, info: &Album) -> Option<Vec<String>> {
+    if info.is_playlist || !info.genres.is_empty() {
+        return None;
+    }
+    // No genres, try to get some from last.fm
+    match handler.lastfm.artist_top_tags(info.artist.as_ref()?).await {
+        Ok(genres) => Some(genres),
+        Err(err) => {
+            // Log error but carry on
+            eprintln!("Couldn't retrieve genres from lastfm: {}", err);
+            None
+        }
+    }
+}
+
 async fn build_message_contents(
-    handler: &Handler,
-    info: &mut Album,
+    lp_name: Option<&str>,
+    info: &Album,
     time: Option<&str>,
     role_id: Option<u64>,
 ) -> anyhow::Result<String> {
     let when = convert_lp_time(time)?;
-    let lp_name = info.format_name();
-    if let (true, Some(artist)) = (info.genres.is_empty(), &info.artist) {
-        // No genres, try to get some from last.fm
-        match handler.lastfm.artist_top_tags(artist).await {
-            Ok(genres) => info.genres = genres,
-            Err(err) => {
-                // Log error but carry on
-                eprintln!("Couldn't retrieve genres from lastfm: {}", err);
-            }
-        }
-    }
+    let lp_name = lp_name
+        .map(str::to_string)
+        .unwrap_or_else(|| info.format_name());
     let mut resp_content = format!(
         "{} {} {}\n",
         role_id // mention role if set
@@ -108,15 +115,18 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             (None, None) => bail!("Please specify something to LP"),
         }
         .unwrap_or_else(|| Album {
-            name: lp_name,
             url: link,
             ..Default::default()
         });
+        // get genres if needed
+        if let Some(genres) = get_lastfm_genres(handler, &info).await {
+            info.genres = genres
+        }
 
         let guild_id = self.command.guild_id.unwrap().0;
         let role_id = handler.get_role_id(guild_id);
         let resp_content =
-            build_message_contents(handler, &mut info, time.as_deref(), role_id).await?;
+            build_message_contents(lp_name.as_deref(), &info, time.as_deref(), role_id).await?;
         let webhook = handler.get_webhook(guild_id);
         let message = if let Some(url) = webhook.as_deref() {
             // Send LP message through webhook

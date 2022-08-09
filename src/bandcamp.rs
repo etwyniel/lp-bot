@@ -60,6 +60,7 @@ impl AlbumProvider for Bandcamp {
             genres,
             url: Some(url.to_string()),
             release_date,
+            ..Default::default()
         })
     }
 

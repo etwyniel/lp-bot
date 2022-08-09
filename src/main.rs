@@ -3,11 +3,14 @@ use std::{env, sync};
 
 use album::Album;
 use anyhow::{anyhow, bail};
+use autoreact::ReactsCache;
+use chrono::{Datelike, Utc};
 use lastfm::Lastfm;
 use rusqlite::Connection;
 use serenity::model::channel::Channel;
 use serenity::model::interactions::application_command::ApplicationCommandType;
 use serenity::model::interactions::autocomplete::AutocompleteInteraction;
+use serenity::model::prelude::Message;
 use serenity::{
     async_trait,
     model::{
@@ -23,6 +26,7 @@ use serenity::{
     prelude::*,
 };
 mod album;
+mod autoreact;
 mod bandcamp;
 mod command_context;
 mod db;
@@ -33,13 +37,21 @@ mod spotify;
 
 use album::AlbumProvider;
 use bandcamp::Bandcamp;
-use command_context::SlashCommand;
+use command_context::{get_focused_option, get_str_opt_ac, SlashCommand};
+use db::Birthday;
 use spotify::Spotify;
 
 pub struct Handler {
     db: sync::Mutex<Connection>,
     providers: Vec<Box<dyn AlbumProvider>>,
     lastfm: Lastfm,
+    reacts_cache: RwLock<ReactsCache>,
+}
+
+enum CommandResponse {
+    None,
+    Public(String),
+    Private(String),
 }
 
 impl Handler {
@@ -50,10 +62,12 @@ impl Handler {
             Box::new(Bandcamp::new()),
         ];
         let lastfm = Lastfm::new();
+        let reacts_cache = RwLock::new(autoreact::new(&conn).await?);
         Ok(Handler {
             db: sync::Mutex::new(conn),
             providers,
             lastfm,
+            reacts_cache,
         })
     }
 
@@ -121,11 +135,12 @@ impl Handler {
         self.set_guild_field("webhook", guild_id, webhook)
     }
 
-    async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<Option<String>> {
+    async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<CommandResponse> {
         let guild_id = cmd
             .command
             .guild_id
-            .ok_or_else(|| anyhow!("Must be run in a server"))?;
+            .ok_or_else(|| anyhow!("Must be run in a server"))?
+            .0;
         match cmd.name() {
             "lp" => {
                 let lp_name = cmd.str_opt("album");
@@ -134,7 +149,7 @@ impl Handler {
                 let provider = cmd.str_opt("provider");
                 cmd.run_lp(lp_name, link, time, provider)
                     .await
-                    .map(|_| None)
+                    .map(|_| CommandResponse::None)
             }
             "album" => {
                 let album_query = cmd.str_opt("album").unwrap();
@@ -159,7 +174,7 @@ impl Handler {
                             _ = writeln!(&mut contents, "{}", &genres);
                         }
                         contents.push_str(info.url.as_deref().unwrap_or("no link found"));
-                        Ok(Some(contents))
+                        Ok(CommandResponse::Public(contents))
                     }
                 }
             }
@@ -167,7 +182,7 @@ impl Handler {
                 let time = cmd.str_opt("time").expect("missing time");
                 let parsed = reltime::parse_time(&time);
                 let contents = format!("{} is in <t:{}:R>", time, parsed.timestamp());
-                Ok(Some(contents))
+                Ok(CommandResponse::Public(contents))
             }
             "setrole" => {
                 let role = cmd.role_opt("role");
@@ -179,7 +194,7 @@ impl Handler {
                     Some(r) => format!("LP role changed to <@&{}>", r.id.0),
                     None => "LP role removed".to_string(),
                 };
-                Ok(Some(contents))
+                Ok(CommandResponse::Public(contents))
             }
             "setcreatethreads" => {
                 let b = cmd.bool_opt("create_threads");
@@ -191,23 +206,18 @@ impl Handler {
                     "LPBot will {}create threads for listening parties",
                     if b == Some(true) { "" } else { "not " }
                 );
-                Ok(Some(contents))
+                Ok(CommandResponse::Public(contents))
             }
             "setwebhook" => {
                 let wh = cmd.str_opt("webhook");
-                self.set_webhook(Some(guild_id.0), wh.as_deref())?;
+                self.set_webhook(Some(guild_id), wh.as_deref())?;
                 let contents = format!(
                     "LPBot will {}use a webhook",
                     if wh.is_some() { "" } else { "not " }
                 );
-                Ok(Some(contents))
+                Ok(CommandResponse::Public(contents))
             }
             "quote" => {
-                let guild_id = cmd
-                    .command
-                    .guild_id
-                    .ok_or_else(|| anyhow!("Must be run in a server"))?
-                    .0;
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
                     let quote_number = self.add_quote(guild_id, message)?;
                     let link = message.id.link(message.channel_id, Some(GuildId(guild_id)));
@@ -215,7 +225,7 @@ impl Handler {
                         Some(n) => format!("Quote saved as #{}: {}", n, link),
                         None => "Quote already added".to_string(),
                     };
-                    Ok(Some(resp_text))
+                    Ok(CommandResponse::Public(resp_text))
                 } else {
                     let quote = if let Some(quote_number) = cmd.int_opt("number") {
                         self.fetch_quote(guild_id, quote_number as u64)?
@@ -245,8 +255,70 @@ impl Handler {
                                 })
                         })
                         .await?;
-                    Ok(None)
+                    Ok(CommandResponse::None)
                 }
+            }
+            "bday" => {
+                let day = cmd.int_opt("day").unwrap() as u8;
+                let month = cmd.int_opt("month").unwrap() as u8;
+                let year = cmd.int_opt("year").map(|y| y as u16);
+                let guild_id = cmd
+                    .command
+                    .guild_id
+                    .ok_or_else(|| anyhow!("Must be run in a server"))?
+                    .0;
+                let user_id = cmd.command.user.id.0;
+                cmd.handler
+                    .add_birthday(guild_id, user_id, day, month, year)?;
+                Ok(CommandResponse::Private("Birthday set!".to_string()))
+            }
+            "bdays" => {
+                let mut bdays = self.get_bdays(guild_id)?;
+                let today = Utc::today();
+                let current_day = today.day() as u8;
+                let current_month = today.month() as u8;
+                bdays.sort_unstable_by_key(|Birthday { day, mut month, .. }| {
+                    if month < current_month || (month == current_month && *day < current_day) {
+                        month += 12;
+                    }
+                    month as u64 * 31 + *day as u64
+                });
+                let res = bdays
+                    .into_iter()
+                    .map(|b| format!("`{:02}/{:02}` • <@{}>", b.day, b.month, b.user_id))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                cmd.command
+                    .create_interaction_response(&cmd.ctx.http, |resp| {
+                        resp.interaction_response_data(|data| {
+                            let header = if let Some(server) =
+                                cmd.command.guild_id.and_then(|g| g.name(&cmd.ctx))
+                            {
+                                format!("Birthdays in {}", server)
+                            } else {
+                                "Birthdays".to_string()
+                            };
+                            data.embed(|embed| embed.author(|a| a.name(header)).description(res))
+                        })
+                    })
+                    .await?;
+                Ok(CommandResponse::None)
+            }
+            "add_autoreact" => {
+                let trigger = cmd.str_opt("trigger").unwrap().to_lowercase();
+                let emote = cmd.str_opt("emote").unwrap();
+                cmd.handler
+                    .add_autoreact(guild_id, &trigger, &emote)
+                    .await?;
+                Ok(CommandResponse::Private("Autoreact added".to_string()))
+            }
+            "remove_autoreact" => {
+                let trigger = cmd.str_opt("trigger").unwrap().to_lowercase();
+                let emote = cmd.str_opt("emote").unwrap();
+                cmd.handler
+                    .remove_autoreact(guild_id, &trigger, &emote)
+                    .await?;
+                Ok(CommandResponse::Private("Autoreact removed".to_string()))
             }
             _ => bail!("Unknown command"),
         }
@@ -259,9 +331,44 @@ impl Handler {
     ) -> anyhow::Result<()> {
         let mut choices: Vec<(String, String)> = vec![];
         let options = &ac.data.options;
+        let guild_id = ac
+            .guild_id
+            .ok_or_else(|| anyhow!("Must be run in a server"))?
+            .0;
         match ac.data.name.as_str() {
             "lp" => {
                 choices = self.autocomplete_lp(options).await?;
+            }
+            "quote" => {
+                let val = get_str_opt_ac(options, "number");
+                if let Some(v) = val {
+                    let quotes = self.list_quotes(guild_id, v)?;
+                    ac.create_autocomplete_response(&ctx.http, |r| {
+                        quotes
+                            .into_iter()
+                            .map(|(num, quote)| (num, quote.chars().take(100).collect::<String>()))
+                            .for_each(|(num, q)| {
+                                r.add_int_choice(q, num as i64);
+                            });
+                        r
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            }
+            "remove_autoreact" => {
+                let trigger = get_str_opt_ac(options, "trigger").unwrap_or("");
+                let emote = get_str_opt_ac(options, "emote").unwrap_or("");
+                let res = self.autocomplete_autoreact(guild_id, trigger, emote)?;
+                let focused = match get_focused_option(options) {
+                    Some(f) => f,
+                    None => return Ok(()),
+                };
+                choices.extend(
+                    res.into_iter()
+                        .map(|(trigger, emote)| if focused == "trigger" { trigger } else { emote })
+                        .map(|v| (v.clone(), v)),
+                );
             }
             _ => (),
         }
@@ -288,8 +395,13 @@ impl EventHandler for Handler {
                 command: &command,
             };
             let (contents, flags) = match self.process_command(cmd).await {
-                Ok(None) => return,
-                Ok(Some(s)) => (s, InteractionApplicationCommandCallbackDataFlags::empty()),
+                Ok(CommandResponse::None) => return,
+                Ok(CommandResponse::Public(s)) => {
+                    (s, InteractionApplicationCommandCallbackDataFlags::empty())
+                }
+                Ok(CommandResponse::Private(s)) => {
+                    (s, InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
+                }
                 Err(e) => {
                     eprintln!("Error processing command {}: {:?}", &command.data.name, e);
                     (
@@ -375,6 +487,102 @@ impl EventHandler for Handler {
                 .create_application_command(|command| {
                     command.name("ping").description("A ping command")
                 })
+                .create_application_command(|command| {
+                    command
+                        .name("bday")
+                        .description("Set your birthday")
+                        .create_option(|option| {
+                            option
+                                .name("day")
+                                .description("Day")
+                                .kind(ApplicationCommandOptionType::Integer)
+                                .min_int_value(1)
+                                .max_int_value(31)
+                                .required(true)
+                        })
+                        .create_option(|option| {
+                            const MONTHS: [&str; 12] = [
+                                "January",
+                                "February",
+                                "March",
+                                "April",
+                                "May",
+                                "June",
+                                "July",
+                                "August",
+                                "September",
+                                "October",
+                                "November",
+                                "December",
+                            ];
+                            option
+                                .name("month")
+                                .description("Month")
+                                .kind(ApplicationCommandOptionType::Integer)
+                                .min_int_value(1)
+                                .max_int_value(12)
+                                .required(true);
+                            MONTHS.iter().enumerate().for_each(|(n, month)| {
+                                option.add_int_choice(month, n as i32 + 1);
+                            });
+                            option
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("year")
+                                .description("Year")
+                                .kind(ApplicationCommandOptionType::Integer)
+                        })
+                })
+                .create_application_command(|command| {
+                    command.name("bdays").description("List server birthdays")
+                })
+                .create_application_command(|command| {
+                    command
+                        .name("add_autoreact")
+                        .description("Automatically add reactions to messages")
+                        .default_member_permissions(Permissions::MANAGE_MESSAGES)
+                        .create_option(|option| {
+                            option
+                                .name("trigger")
+                                .description(
+                                    "The word that will trigger the reaction (case-insensitive)",
+                                )
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("emote")
+                                .description("The emote to react with")
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                        })
+                })
+                .create_application_command(|command| {
+                    command
+                        .name("remove_autoreact")
+                        .description("Remove automatic reaction")
+                        .default_member_permissions(Permissions::MANAGE_MESSAGES)
+                        .create_option(|option| {
+                            option
+                                .name("trigger")
+                                .description(
+                                    "The word that triggers the reaction (case-insensitive)",
+                                )
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                                .set_autocomplete(true)
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("emote")
+                                .description("The emote to no longer react with")
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                                .set_autocomplete(true)
+                        })
+                })
         })
         .await
         .unwrap();
@@ -394,7 +602,7 @@ impl EventHandler for Handler {
                 .create_option(|option| {
                     option
                         .name("time")
-                        .description("Time at which the LP will take place")
+                        .description("Time at which the LP will take place (e.g. XX:20, +5)")
                         .kind(ApplicationCommandOptionType::String)
                 })
                 .create_option(|option| {
@@ -485,6 +693,7 @@ impl EventHandler for Handler {
                         .description("Number the quote was saved as (optional)")
                         .kind(ApplicationCommandOptionType::Integer)
                         .min_int_value(1)
+                        .set_autocomplete(true)
                 })
         })
         .await
@@ -506,6 +715,12 @@ impl EventHandler for Handler {
         .await
         .unwrap();
     }
+
+    async fn message(&self, ctx: Context, new_message: Message) {
+        if let Err(e) = self.add_reacts(&ctx, new_message).await {
+            eprintln!("Error adding reacts: {}", e);
+        }
+    }
 }
 
 #[tokio::main]
@@ -518,10 +733,8 @@ async fn main() {
         }
     };
 
-    // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 
-    // The Application Id is usually the Bot User Id.
     let application_id: u64 = env::var("APPLICATION_ID")
         .expect("Expected an application id in the environment")
         .parse()
@@ -539,7 +752,7 @@ async fn main() {
     .await
     .expect("Error creating client");
 
-    // Finally, start a single shard, and start listening to events.
+    // Start a single shard, and start listening to events.
     //
     // Shards will automatically attempt to reconnect, and will perform
     // exponential backoff until it reconnects.

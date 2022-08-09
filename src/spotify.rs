@@ -33,6 +33,7 @@ impl Spotify {
             genres,
             release_date,
             url: Some(album.id.url()),
+            ..Default::default()
         })
     }
 

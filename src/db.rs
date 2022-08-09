@@ -17,6 +17,13 @@ pub struct Quote {
     pub contents: String,
 }
 
+pub struct Birthday {
+    pub user_id: u64,
+    pub day: u8,
+    pub month: u8,
+    pub year: Option<u16>,
+}
+
 impl Handler {
     pub fn ensure_guild_table(&self, guild_id: u64) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap();
@@ -144,6 +151,54 @@ impl Handler {
         };
         self.fetch_quote(guild_id, number)
     }
+
+    pub fn list_quotes(&self, guild_id: u64, like: &str) -> anyhow::Result<Vec<(u64, String)>> {
+        let db = self.db.lock().unwrap();
+        let res = db.prepare(
+            "SELECT quote_number, contents FROM quote WHERE guild_id = ?1 AND contents LIKE '%'||?2||'%' LIMIT 15",
+        )?
+            .query(params![guild_id, like])?
+            .map(|row| Ok((row.get(0)?, row.get(1)?)))
+            .collect()?;
+        Ok(res)
+    }
+
+    pub fn add_birthday(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        day: u8,
+        month: u8,
+        year: Option<u16>,
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO bdays (guild_id, user_id, day, month, year)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(guild_id, user_id) DO UPDATE
+                 SET day = ?3, month = ?4, year = ?5
+                 WHERE guild_id = ?1 AND user_id = ?2",
+            params![guild_id, user_id, day, month, year],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_bdays(&self, guild_id: u64) -> anyhow::Result<Vec<Birthday>> {
+        let db = self.db.lock().unwrap();
+        let res = db
+            .prepare("SELECT user_id, day, month, year FROM bdays WHERE guild_id = ?1")?
+            .query([guild_id])?
+            .map(|row| {
+                Ok(Birthday {
+                    user_id: row.get(0)?,
+                    day: row.get(1)?,
+                    month: row.get(2)?,
+                    year: row.get(3)?,
+                })
+            })
+            .collect()?;
+        Ok(res)
+    }
 }
 
 pub fn init() -> anyhow::Result<Connection> {
@@ -169,6 +224,25 @@ pub fn init() -> anyhow::Result<Connection> {
             contents STRING,
             UNIQUE(guild_id, quote_number),
             UNIQUE(guild_id, message_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bdays (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            day INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            year INTEGER,
+            UNIQUE(guild_id, user_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS autoreact (
+            guild_id INTEGER NOT NULL,
+            trigger STRING NOT NULL,
+            emote STRING NOT NULL
         )",
         [],
     )?;

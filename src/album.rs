@@ -7,6 +7,7 @@ pub struct Album {
     pub genres: Vec<String>,
     pub release_date: Option<String>,
     pub url: Option<String>,
+    pub is_playlist: bool,
 }
 
 #[async_trait]
