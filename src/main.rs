@@ -32,14 +32,16 @@ mod command_context;
 mod db;
 mod lastfm;
 mod lp;
+mod magik;
 mod reltime;
 mod spotify;
 
 use album::AlbumProvider;
 use bandcamp::Bandcamp;
-use command_context::{get_focused_option, get_str_opt_ac, SlashCommand};
+use command_context::{get_focused_option, get_str_opt_ac, CommandResponse, SlashCommand};
 use db::Birthday;
 use spotify::Spotify;
+use tokio::sync;
 
 pub struct Handler {
     db: sync::Mutex<Connection>,
@@ -111,28 +113,37 @@ impl Handler {
         Ok(choices)
     }
 
-    fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
+    async fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
             None => bail!("Must be run in a server"),
         };
-        self.set_guild_field("role_id", guild_id, role_id)
+        self.set_guild_field("role_id", guild_id, role_id).await
     }
 
-    fn set_should_create_threads(&self, guild_id: Option<u64>, create: bool) -> anyhow::Result<()> {
+    async fn set_should_create_threads(
+        &self,
+        guild_id: Option<u64>,
+        create: bool,
+    ) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
             None => bail!("Must be run in a server"),
         };
         self.set_guild_field("create_threads", guild_id, create)
+            .await
     }
 
-    fn set_webhook(&self, guild_id: Option<u64>, webhook: Option<&str>) -> anyhow::Result<()> {
+    async fn set_webhook(
+        &self,
+        guild_id: Option<u64>,
+        webhook: Option<&str>,
+    ) -> anyhow::Result<()> {
         let guild_id = match guild_id {
             Some(id) => id,
             None => bail!("Must be run in a server"),
         };
-        self.set_guild_field("webhook", guild_id, webhook)
+        self.set_guild_field("webhook", guild_id, webhook).await
     }
 
     async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<CommandResponse> {
@@ -189,7 +200,8 @@ impl Handler {
                 self.set_role(
                     cmd.command.guild_id.map(|g| g.0),
                     role.as_ref().map(|r| r.id.0),
-                )?;
+                )
+                .await?;
                 let contents = match role {
                     Some(r) => format!("LP role changed to <@&{}>", r.id.0),
                     None => "LP role removed".to_string(),
@@ -201,7 +213,8 @@ impl Handler {
                 self.set_should_create_threads(
                     cmd.command.guild_id.map(|g| g.0),
                     b.unwrap_or(false),
-                )?;
+                )
+                .await?;
                 let contents = format!(
                     "LPBot will {}create threads for listening parties",
                     if b == Some(true) { "" } else { "not " }
@@ -210,16 +223,16 @@ impl Handler {
             }
             "setwebhook" => {
                 let wh = cmd.str_opt("webhook");
-                self.set_webhook(Some(guild_id), wh.as_deref())?;
+                self.set_webhook(Some(guild_id), wh.as_deref()).await?;
                 let contents = format!(
                     "LPBot will {}use a webhook",
                     if wh.is_some() { "" } else { "not " }
                 );
-                Ok(CommandResponse::Public(contents))
+                Ok(CommandResponse::Private(contents))
             }
             "quote" => {
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
-                    let quote_number = self.add_quote(guild_id, message)?;
+                    let quote_number = self.add_quote(guild_id, message).await?;
                     let link = message.id.link(message.channel_id, Some(GuildId(guild_id)));
                     let resp_text = match quote_number {
                         Some(n) => format!("Quote saved as #{}: {}", n, link),
@@ -228,9 +241,9 @@ impl Handler {
                     Ok(CommandResponse::Public(resp_text))
                 } else {
                     let quote = if let Some(quote_number) = cmd.int_opt("number") {
-                        self.fetch_quote(guild_id, quote_number as u64)?
+                        self.fetch_quote(guild_id, quote_number as u64).await?
                     } else {
-                        self.get_random_quote(guild_id)?
+                        self.get_random_quote(guild_id).await?
                     }
                     .ok_or_else(|| anyhow!("No such quote"))?;
                     let message_url = format!(
@@ -269,11 +282,12 @@ impl Handler {
                     .0;
                 let user_id = cmd.command.user.id.0;
                 cmd.handler
-                    .add_birthday(guild_id, user_id, day, month, year)?;
+                    .add_birthday(guild_id, user_id, day, month, year)
+                    .await?;
                 Ok(CommandResponse::Private("Birthday set!".to_string()))
             }
             "bdays" => {
-                let mut bdays = self.get_bdays(guild_id)?;
+                let mut bdays = self.get_bdays(guild_id).await?;
                 let today = Utc::today();
                 let current_day = today.day() as u8;
                 let current_month = today.month() as u8;
@@ -342,7 +356,7 @@ impl Handler {
             "quote" => {
                 let val = get_str_opt_ac(options, "number");
                 if let Some(v) = val {
-                    let quotes = self.list_quotes(guild_id, v)?;
+                    let quotes = self.list_quotes(guild_id, v).await?;
                     ac.create_autocomplete_response(&ctx.http, |r| {
                         quotes
                             .into_iter()
@@ -359,7 +373,9 @@ impl Handler {
             "remove_autoreact" => {
                 let trigger = get_str_opt_ac(options, "trigger").unwrap_or("");
                 let emote = get_str_opt_ac(options, "emote").unwrap_or("");
-                let res = self.autocomplete_autoreact(guild_id, trigger, emote)?;
+                let res = self
+                    .autocomplete_autoreact(guild_id, trigger, emote)
+                    .await?;
                 let focused = match get_focused_option(options) {
                     Some(f) => f,
                     None => return Ok(()),
@@ -434,7 +450,7 @@ impl EventHandler for Handler {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let number = match self.add_quote(id.0, &message) {
+            let number = match self.add_quote(id.0, &message).await {
                 Ok(Some(n)) => n,
                 Ok(None) => return,
                 Err(e) => {

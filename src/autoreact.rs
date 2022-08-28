@@ -39,8 +39,7 @@ pub type ReactsCache = HashMap<u64, Vec<AutoReact>>;
 
 pub async fn new(db: &Connection) -> anyhow::Result<ReactsCache> {
     let cache = {
-        let res = db
-            .prepare("SELECT guild_id, trigger, emote FROM autoreact")?
+        db.prepare("SELECT guild_id, trigger, emote FROM autoreact")?
             .query([])?
             .map(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .try_fold::<_, anyhow::Error, _>(
@@ -52,8 +51,7 @@ pub async fn new(db: &Connection) -> anyhow::Result<ReactsCache> {
                         .push(AutoReact::new(&trigger, &emote)?);
                     Ok(cache)
                 },
-            )?;
-        res
+            )?
     };
     Ok(cache)
 }
@@ -67,7 +65,7 @@ impl Handler {
     ) -> anyhow::Result<()> {
         let parsed = AutoReact::new(trigger, emote)?;
         {
-            let db = self.db.lock().unwrap();
+            let db = self.db.lock().await;
             db.execute(
                 "INSERT INTO autoreact (guild_id, trigger, emote) VALUES (?1, ?2, ?3)",
                 params![guild_id, trigger, emote],
@@ -89,7 +87,7 @@ impl Handler {
         emote: &str,
     ) -> anyhow::Result<()> {
         {
-            let db = self.db.lock().unwrap();
+            let db = self.db.lock().await;
             db.execute(
                 "DELETE FROM autoreact WHERE guild_id = ?1 AND trigger = ?2 AND emote = ?3",
                 params![guild_id, trigger, emote],
@@ -102,13 +100,13 @@ impl Handler {
         Ok(())
     }
 
-    pub fn autocomplete_autoreact(
+    pub async fn autocomplete_autoreact(
         &self,
         guild_id: u64,
         trigger: &str,
         emote: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().await;
         let res = db
             .prepare(
                 "SELECT trigger, emote FROM autoreact WHERE

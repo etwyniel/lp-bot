@@ -124,14 +124,17 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         }
 
         let guild_id = self.command.guild_id.unwrap().0;
-        let role_id = handler.get_role_id(guild_id);
+        let role_id = handler.get_role_id(guild_id).await;
         let resp_content =
             build_message_contents(lp_name.as_deref(), &info, time.as_deref(), role_id).await?;
-        let webhook = handler.get_webhook(guild_id);
-        let message = if let Some(url) = webhook.as_deref() {
+        let webhook = handler.get_webhook(guild_id).await;
+        let wh = match webhook.as_deref().map(|url| http.get_webhook_from_url(url)) {
+            Some(fut) => Some(fut.await?),
+            None => None,
+        };
+        let message = if let Some(wh) = &wh {
             // Send LP message through webhook
             // This lets us impersonate the user who sent the command
-            let wh = http.get_webhook_from_url(url).await?;
             let user = &self.command.user;
             let avatar_url = user.avatar_url();
             let nick = user // try to get the user's nickname
@@ -150,13 +153,15 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             .unwrap() // Message is present because we set wait to true in execute
         } else {
             // Create interaction response
-            self.respond(&resp_content, role_id).await?
+            self.respond(CommandResponse::Public(resp_content), role_id)
+                .await?
+                .unwrap()
         };
         let mut response = format!(
             "LP created: {}",
             message.id.link(message.channel_id, self.command.guild_id)
         );
-        if handler.get_create_threads(guild_id) {
+        if handler.get_create_threads(guild_id).await {
             // Create a thread from the response message for the LP to take place in
             let chan = message.channel(http).await?;
             let thread_name = info.name.as_deref().unwrap_or("Listening party");
@@ -178,9 +183,14 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
                 response = format!("LP created: <#{}>", thread.id.as_u64());
             }
         }
-        if webhook.is_some() {
+        if let Some(wh) = wh {
             // If we used a webhook, we still need to create the interaction response
-            self.respond(&response, None).await?;
+            let response = if wh.channel_id == Some(self.command.channel_id) {
+                CommandResponse::Private(response)
+            } else {
+                CommandResponse::Public(response)
+            };
+            self.respond(response, None).await?;
         }
         Ok(())
     }
