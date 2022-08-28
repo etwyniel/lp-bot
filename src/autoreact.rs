@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
-use anyhow::anyhow;
+use anyhow::Context as _;
 use fallible_iterator::FallibleIterator;
 use rusqlite::{params, Connection};
 use serenity::{
-    model::prelude::{EmojiId, Message, ReactionType},
+    model::prelude::{Message, ReactionType},
     prelude::Context,
 };
 
@@ -16,13 +16,7 @@ pub struct AutoReact {
 }
 
 fn parse_emote(s: &str) -> anyhow::Result<ReactionType> {
-    let mut parts = s.trim_start_matches('<').trim_end_matches('>').split(':');
-    let mut next = || parts.next().ok_or_else(|| anyhow!("Invalid emote"));
-    Ok(ReactionType::Custom {
-        animated: next()?.len() == 1,
-        name: Some(next()?.to_string()),
-        id: EmojiId(next()?.parse().unwrap()),
-    })
+    Ok(ReactionType::from_str(s)?)
 }
 
 impl AutoReact {

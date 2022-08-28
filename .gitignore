@@ -1,4 +1,4 @@
 /target
-token
+token*
 *.sqlite
-env.sh
+env*.sh
