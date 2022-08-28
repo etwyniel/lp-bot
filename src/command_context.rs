@@ -9,14 +9,41 @@ use serenity::{
             ApplicationCommandInteraction, ApplicationCommandInteractionDataOption,
             ApplicationCommandInteractionDataOptionValue,
         },
+        prelude::InteractionApplicationCommandCallbackDataFlags,
     },
 };
 
 use crate::Handler;
 
+pub enum CommandResponse {
+    None,
+    Public(String),
+    Private(String),
+}
+
+impl CommandResponse {
+    fn to_contents_and_flags(
+        self,
+    ) -> Option<(String, InteractionApplicationCommandCallbackDataFlags)> {
+        Some(match self {
+            CommandResponse::None => return None,
+            CommandResponse::Public(s) => {
+                (s, InteractionApplicationCommandCallbackDataFlags::empty())
+            }
+            CommandResponse::Private(s) => {
+                (s, InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
+            }
+        })
+    }
+}
+
 #[async_trait]
 pub trait Responder {
-    async fn respond(&self, contents: &str, role_id: Option<u64>) -> anyhow::Result<Message>;
+    async fn respond(
+        &self,
+        contents: CommandResponse,
+        role_id: Option<u64>,
+    ) -> anyhow::Result<Option<Message>>;
     fn ctx(&self) -> &Context;
     fn handler(&self) -> &Handler;
 }
@@ -29,14 +56,23 @@ pub struct SlashCommand<'a, 'b> {
 
 #[async_trait]
 impl Responder for SlashCommand<'_, '_> {
-    async fn respond(&self, contents: &str, role_id: Option<u64>) -> anyhow::Result<Message> {
+    async fn respond(
+        &self,
+        contents: CommandResponse,
+        role_id: Option<u64>,
+    ) -> anyhow::Result<Option<Message>> {
+        let (contents, flags) = match contents.to_contents_and_flags() {
+            None => return Ok(None),
+            Some(c) => c,
+        };
         self.command
             .create_interaction_response(&self.ctx.http, |resp|
                 resp
                 .kind(serenity::model::interactions::InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|message|
                     message
-                    .content(contents)
+                    .content(&contents)
+                    .flags(flags)
                     .allowed_mentions(|mentions| mentions.roles(role_id))
                 )
             ).await?;
@@ -44,6 +80,7 @@ impl Responder for SlashCommand<'_, '_> {
             .get_interaction_response(&self.ctx.http)
             .await
             .map_err(anyhow::Error::from)
+            .map(Some)
     }
 
     fn ctx(&self) -> &Context {
@@ -127,7 +164,15 @@ pub struct TextCommand<'a, 'b> {
 
 #[async_trait]
 impl Responder for TextCommand<'_, '_> {
-    async fn respond(&self, contents: &str, role_id: Option<u64>) -> anyhow::Result<Message> {
+    async fn respond(
+        &self,
+        contents: CommandResponse,
+        role_id: Option<u64>,
+    ) -> anyhow::Result<Option<Message>> {
+        let (contents, _) = match contents.to_contents_and_flags() {
+            None => return Ok(None),
+            Some(c) => c,
+        };
         let channel = match self.message.channel(&self.ctx.http).await? {
             Channel::Guild(c) => c,
             _ => return Err(anyhow!("Invalid channel")),
@@ -139,6 +184,7 @@ impl Responder for TextCommand<'_, '_> {
             })
             .await
             .map_err(anyhow::Error::from)
+            .map(Some)
     }
 
     fn ctx(&self) -> &Context {

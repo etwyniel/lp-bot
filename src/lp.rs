@@ -9,7 +9,7 @@ use serenity::model::channel::ChannelType;
 use serenity::model::interactions::application_command::ApplicationCommandInteractionDataOption;
 
 use crate::album::Album;
-use crate::command_context::{get_focused_option, get_str_opt_ac, Responder};
+use crate::command_context::{get_focused_option, get_str_opt_ac, CommandResponse, Responder};
 use crate::{command_context::SlashCommand, Handler};
 
 fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
@@ -36,7 +36,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         let extra_mins: i64 = cap.get(1).unwrap().as_str().parse()?;
         lp_time = lp_time.add(Duration::minutes(extra_mins));
     } else {
-        bail!("Invalid time {}", time);
+        bail!("Invalid time: {}", time);
     }
 
     // timestamp and relative time
@@ -96,9 +96,10 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
             // As a special case for convenience, if we have a URL in lp_name, use that as link
             if link.is_some() && link != lp_name {
-                bail!("Too many links!");
+                lp_name = None;
+            } else {
+                link = lp_name.take();
             }
-            link = lp_name.take();
         }
         let handler = self.handler;
         let http = &self.ctx.http;

@@ -119,8 +119,16 @@ impl Handler {
         Ok(res)
     }
 
+    // Add reactions for autoreacts whose trigger match msg
     pub async fn add_reacts(&self, ctx: &Context, msg: Message) -> anyhow::Result<()> {
-        let lower = msg.content.to_lowercase();
+        let mut lower = msg.content.to_lowercase();
+        lower.push_str(
+            &msg.embeds
+                .iter()
+                .flat_map(|e| e.description.as_deref())
+                .collect::<String>()
+                .to_lowercase(),
+        );
         let mut indices = Vec::new();
         let cache = self.reacts_cache.read().await;
         let guild_id = match msg.guild_id {
@@ -136,9 +144,12 @@ impl Handler {
                 indices.push((ndx, i));
             }
         }
+        // sort by trigger position so reacts get added in order
         indices.sort_by_key(|(ndx, _)| *ndx);
         for (_, i) in indices {
-            msg.react(&ctx.http, reacts[i].emote.clone()).await?;
+            msg.react(&ctx.http, reacts[i].emote.clone())
+                .await
+                .context("could not add reaction")?;
         }
         Ok(())
     }

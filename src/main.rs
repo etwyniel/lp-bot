@@ -1,5 +1,6 @@
+use std::env;
 use std::fmt::Write;
-use std::{env, sync};
+use std::time::Duration;
 
 use album::Album;
 use anyhow::{anyhow, bail};
@@ -8,6 +9,7 @@ use chrono::{Datelike, Utc};
 use lastfm::Lastfm;
 use rusqlite::Connection;
 use serenity::model::channel::Channel;
+use serenity::model::id::{ChannelId, UserId};
 use serenity::model::interactions::application_command::ApplicationCommandType;
 use serenity::model::interactions::autocomplete::AutocompleteInteraction;
 use serenity::model::prelude::Message;
@@ -48,12 +50,6 @@ pub struct Handler {
     providers: Vec<Box<dyn AlbumProvider>>,
     lastfm: Lastfm,
     reacts_cache: RwLock<ReactsCache>,
-}
-
-enum CommandResponse {
-    None,
-    Public(String),
-    Private(String),
 }
 
 impl Handler {
@@ -254,13 +250,20 @@ impl Handler {
                         "{}\n - <@{}> [(Source)]({})",
                         &quote.contents, quote.author_id, message_url
                     );
+                    let author_avatar = UserId(quote.author_id)
+                        .to_user(&cmd.ctx.http)
+                        .await?
+                        .avatar_url();
                     cmd.command
                         .create_interaction_response(&cmd.ctx.http, |resp| {
                             resp.kind(InteractionResponseType::ChannelMessageWithSource)
                                 .interaction_response_data(|data| {
                                     data.embed(|embed| {
                                         embed
-                                            .author(|a| a.name(format!("#{}", quote.quote_number)))
+                                            .author(|a| {
+                                                author_avatar.map(|av| a.icon_url(av));
+                                                a.name(format!("#{}", quote.quote_number))
+                                            })
                                             .description(&contents)
                                             .url(message_url)
                                             .timestamp(quote.ts.format("%+").to_string())
@@ -557,7 +560,7 @@ impl EventHandler for Handler {
                     command
                         .name("add_autoreact")
                         .description("Automatically add reactions to messages")
-                        .default_member_permissions(Permissions::MANAGE_MESSAGES)
+                        .default_member_permissions(Permissions::MANAGE_EMOJIS_AND_STICKERS)
                         .create_option(|option| {
                             option
                                 .name("trigger")
