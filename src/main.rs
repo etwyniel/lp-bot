@@ -1,28 +1,33 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write;
 use std::time::Duration;
 
 use album::Album;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context as _};
 use autoreact::ReactsCache;
 use chrono::{Datelike, Utc};
+use commands::BotCommand;
 use lastfm::Lastfm;
 use rusqlite::Connection;
-use serenity::model::channel::Channel;
-use serenity::model::id::{ChannelId, UserId};
-use serenity::model::interactions::application_command::ApplicationCommandType;
-use serenity::model::interactions::autocomplete::AutocompleteInteraction;
+use serenity::builder::CreateApplicationCommandOption;
+use serenity::model::application::command::CommandType;
+use serenity::model::application::interaction::autocomplete::AutocompleteInteraction;
+use serenity::model::channel::{Channel, Embed};
+use serenity::model::event::ChannelPinsUpdateEvent;
+use serenity::model::id::ChannelId;
+use serenity::model::prelude::interaction::application_command::{
+    ApplicationCommandInteraction, CommandDataOption, CommandDataOptionValue,
+};
 use serenity::model::prelude::Message;
 use serenity::{
     async_trait,
     model::{
+        application::command::{Command, CommandOptionType},
+        application::interaction::{Interaction, InteractionResponseType, MessageFlags},
         gateway::GatewayIntents,
         gateway::Ready,
         id::GuildId,
-        interactions::{
-            application_command::{ApplicationCommand, ApplicationCommandOptionType},
-            Interaction, InteractionApplicationCommandCallbackDataFlags, InteractionResponseType,
-        },
         permissions::Permissions,
     },
     prelude::*,
@@ -31,17 +36,18 @@ mod album;
 mod autoreact;
 mod bandcamp;
 mod command_context;
+mod commands;
 mod db;
 mod lastfm;
-mod lp;
 mod magik;
 mod reltime;
 mod spotify;
 
 use album::AlbumProvider;
 use bandcamp::Bandcamp;
-use command_context::{get_focused_option, get_str_opt_ac, CommandResponse, SlashCommand};
+use command_context::{get_focused_option, get_str_opt_ac, SlashCommand};
 use db::Birthday;
+use serenity_command::{CommandBuilder, CommandResponse, CommandRunner};
 use spotify::Spotify;
 use tokio::sync;
 
@@ -50,9 +56,27 @@ pub struct Handler {
     providers: Vec<Box<dyn AlbumProvider>>,
     lastfm: Lastfm,
     reacts_cache: RwLock<ReactsCache>,
+    commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
+}
+
+trait InteractionExt {
+    fn guild_id(&self) -> anyhow::Result<GuildId>;
+}
+
+impl InteractionExt for ApplicationCommandInteraction {
+    fn guild_id(&self) -> anyhow::Result<GuildId> {
+        self.guild_id
+            .ok_or_else(|| anyhow!("Must be run in a server"))
+    }
 }
 
 impl Handler {
+    fn init_commands() -> HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>> {
+        let mut commands = HashMap::new();
+        commands::register_commands(&mut commands);
+        commands
+    }
+
     async fn new() -> anyhow::Result<Self> {
         let conn = db::init()?;
         let providers = vec![
@@ -61,11 +85,13 @@ impl Handler {
         ];
         let lastfm = Lastfm::new();
         let reacts_cache = RwLock::new(autoreact::new(&conn).await?);
+        let commands = RwLock::new(Self::init_commands());
         Ok(Handler {
             db: sync::Mutex::new(conn),
             providers,
             lastfm,
             reacts_cache,
+            commands,
         })
     }
 
@@ -109,123 +135,14 @@ impl Handler {
         Ok(choices)
     }
 
-    async fn set_role(&self, guild_id: Option<u64>, role_id: Option<u64>) -> anyhow::Result<()> {
-        let guild_id = match guild_id {
-            Some(id) => id,
-            None => bail!("Must be run in a server"),
-        };
-        self.set_guild_field("role_id", guild_id, role_id).await
-    }
-
-    async fn set_should_create_threads(
-        &self,
-        guild_id: Option<u64>,
-        create: bool,
-    ) -> anyhow::Result<()> {
-        let guild_id = match guild_id {
-            Some(id) => id,
-            None => bail!("Must be run in a server"),
-        };
-        self.set_guild_field("create_threads", guild_id, create)
-            .await
-    }
-
-    async fn set_webhook(
-        &self,
-        guild_id: Option<u64>,
-        webhook: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let guild_id = match guild_id {
-            Some(id) => id,
-            None => bail!("Must be run in a server"),
-        };
-        self.set_guild_field("webhook", guild_id, webhook).await
-    }
-
     async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<CommandResponse> {
         let guild_id = cmd
             .command
             .guild_id
             .ok_or_else(|| anyhow!("Must be run in a server"))?
             .0;
+        let data = &cmd.command.data;
         match cmd.name() {
-            "lp" => {
-                let lp_name = cmd.str_opt("album");
-                let time = cmd.str_opt("time");
-                let link = cmd.str_opt("link");
-                let provider = cmd.str_opt("provider");
-                cmd.run_lp(lp_name, link, time, provider)
-                    .await
-                    .map(|_| CommandResponse::None)
-            }
-            "album" => {
-                let album_query = cmd.str_opt("album").unwrap();
-                let provider = cmd.str_opt("provider");
-                match self.lookup_album(&album_query, provider.as_deref()).await? {
-                    None => bail!("Not found"),
-                    Some(mut info) => {
-                        let mut contents = format!(
-                            "{}{}\n",
-                            info.format_name(),
-                            info.release_date
-                                .as_deref()
-                                .map(|d| format!(" ({})", d))
-                                .unwrap_or_default(),
-                        );
-                        if info.genres.is_empty() {
-                            if let Some(artist) = &info.artist {
-                                info.genres = self.lastfm.artist_top_tags(artist).await?;
-                            }
-                        }
-                        if let Some(genres) = info.format_genres() {
-                            _ = writeln!(&mut contents, "{}", &genres);
-                        }
-                        contents.push_str(info.url.as_deref().unwrap_or("no link found"));
-                        Ok(CommandResponse::Public(contents))
-                    }
-                }
-            }
-            "relative" => {
-                let time = cmd.str_opt("time").expect("missing time");
-                let parsed = reltime::parse_time(&time);
-                let contents = format!("{} is in <t:{}:R>", time, parsed.timestamp());
-                Ok(CommandResponse::Public(contents))
-            }
-            "setrole" => {
-                let role = cmd.role_opt("role");
-                self.set_role(
-                    cmd.command.guild_id.map(|g| g.0),
-                    role.as_ref().map(|r| r.id.0),
-                )
-                .await?;
-                let contents = match role {
-                    Some(r) => format!("LP role changed to <@&{}>", r.id.0),
-                    None => "LP role removed".to_string(),
-                };
-                Ok(CommandResponse::Public(contents))
-            }
-            "setcreatethreads" => {
-                let b = cmd.bool_opt("create_threads");
-                self.set_should_create_threads(
-                    cmd.command.guild_id.map(|g| g.0),
-                    b.unwrap_or(false),
-                )
-                .await?;
-                let contents = format!(
-                    "LPBot will {}create threads for listening parties",
-                    if b == Some(true) { "" } else { "not " }
-                );
-                Ok(CommandResponse::Public(contents))
-            }
-            "setwebhook" => {
-                let wh = cmd.str_opt("webhook");
-                self.set_webhook(Some(guild_id), wh.as_deref()).await?;
-                let contents = format!(
-                    "LPBot will {}use a webhook",
-                    if wh.is_some() { "" } else { "not " }
-                );
-                Ok(CommandResponse::Private(contents))
-            }
             "quote" => {
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
                     let quote_number = self.add_quote(guild_id, message).await?;
@@ -236,58 +153,10 @@ impl Handler {
                     };
                     Ok(CommandResponse::Public(resp_text))
                 } else {
-                    let quote = if let Some(quote_number) = cmd.int_opt("number") {
-                        self.fetch_quote(guild_id, quote_number as u64).await?
-                    } else {
-                        self.get_random_quote(guild_id).await?
-                    }
-                    .ok_or_else(|| anyhow!("No such quote"))?;
-                    let message_url = format!(
-                        "https://discord.com/channels/{}/{}/{}",
-                        quote.guild_id, quote.channel_id, quote.message_id
-                    );
-                    let contents = format!(
-                        "{}\n - <@{}> [(Source)]({})",
-                        &quote.contents, quote.author_id, message_url
-                    );
-                    let author_avatar = UserId(quote.author_id)
-                        .to_user(&cmd.ctx.http)
-                        .await?
-                        .avatar_url();
-                    cmd.command
-                        .create_interaction_response(&cmd.ctx.http, |resp| {
-                            resp.kind(InteractionResponseType::ChannelMessageWithSource)
-                                .interaction_response_data(|data| {
-                                    data.embed(|embed| {
-                                        embed
-                                            .author(|a| {
-                                                author_avatar.map(|av| a.icon_url(av));
-                                                a.name(format!("#{}", quote.quote_number))
-                                            })
-                                            .description(&contents)
-                                            .url(message_url)
-                                            .timestamp(quote.ts.format("%+").to_string())
-                                    })
-                                })
-                        })
-                        .await?;
-                    Ok(CommandResponse::None)
+                    commands::GetQuote::from(data)
+                        .run(self, cmd.ctx, cmd.command)
+                        .await
                 }
-            }
-            "bday" => {
-                let day = cmd.int_opt("day").unwrap() as u8;
-                let month = cmd.int_opt("month").unwrap() as u8;
-                let year = cmd.int_opt("year").map(|y| y as u16);
-                let guild_id = cmd
-                    .command
-                    .guild_id
-                    .ok_or_else(|| anyhow!("Must be run in a server"))?
-                    .0;
-                let user_id = cmd.command.user.id.0;
-                cmd.handler
-                    .add_birthday(guild_id, user_id, day, month, year)
-                    .await?;
-                Ok(CommandResponse::Private("Birthday set!".to_string()))
             }
             "bdays" => {
                 let mut bdays = self.get_bdays(guild_id).await?;
@@ -337,7 +206,29 @@ impl Handler {
                     .await?;
                 Ok(CommandResponse::Private("Autoreact removed".to_string()))
             }
-            _ => bail!("Unknown command"),
+            "magik" => {
+                let url = cmd.str_opt("url").unwrap();
+                let scale = cmd.number_opt("scale").unwrap_or(0.5);
+                cmd.command
+                    .create_interaction_response(&cmd.ctx.http, |resp| {
+                        resp.interaction_response_data(|data| data.content("Processing image..."))
+                    })
+                    .await?;
+                let magiked = magik::magik(&url, scale)?;
+                cmd.command
+                    .create_followup_message(&cmd.ctx.http, |msg| {
+                        msg.add_file((magiked.as_slice(), "out.png"))
+                    })
+                    .await?;
+                Ok(CommandResponse::None)
+            }
+            _ => {
+                if let Some(runner) = self.commands.read().await.get(cmd.name()) {
+                    runner.run(self, cmd.ctx, cmd.command).await
+                } else {
+                    bail!("Unknown command")
+                }
+            }
         }
     }
 
@@ -400,6 +291,153 @@ impl Handler {
         .await
         .map_err(anyhow::Error::from)
     }
+
+    async fn crabdown(&self, ctx: &Context, channel: ChannelId) -> anyhow::Result<()> {
+        for i in 0..3 {
+            channel
+                .send_message(&ctx.http, |msg| msg.content("🦀".repeat(3 - i)))
+                .await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        channel
+            .send_message(&ctx.http, |msg| {
+                msg.content("<a:CrabRave:988508208240922635>")
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn move_pin_to_pinboard(
+        &self,
+        ctx: &Context,
+        channel: ChannelId,
+        guild_id: GuildId,
+    ) -> anyhow::Result<()> {
+        let pins = channel
+            .pins(&ctx.http)
+            .await
+            .context("getting pinned messages")?;
+        let last_pin = match pins.last() {
+            Some(m) => m,
+            _ => return Ok(()),
+        };
+        dbg!(&last_pin);
+        let pinboard_webhook = match self.get_pinboard_webhook(guild_id.0).await {
+            Some(w) => w,
+            _ => return Ok(()),
+        };
+        let author = &last_pin.author;
+        let name = last_pin
+            .author_nick(&ctx.http)
+            .await
+            .unwrap_or_else(|| author.name.clone());
+        let avatar = guild_id
+            .member(&ctx.http, author)
+            .await
+            .ok()
+            .and_then(|member| member.avatar)
+            .filter(|av| av.starts_with("http"))
+            .or_else(|| author.avatar_url())
+            .filter(|av| av.starts_with("http"));
+        let channel_name = channel
+            .name(&ctx)
+            .await
+            .unwrap_or_else(|| "unknown-channel".to_string());
+        let image = last_pin
+            .attachments
+            .iter()
+            .find(|at| at.height.is_some())
+            .map(|at| at.url.as_str());
+        ctx.http
+            .get_webhook_from_url(&pinboard_webhook)
+            .await
+            .context("getting webhook")?
+            .execute(&ctx.http, true, |message| {
+                let mut embeds = Vec::with_capacity(last_pin.embeds.len() + 1);
+                if !last_pin.content.is_empty() || image.is_some() {
+                    embeds.push(Embed::fake(|val| {
+                        image.map(|url| val.image(url));
+                        val.description(format!(
+                            "{}\n\n[(Source)]({})",
+                            last_pin.content,
+                            last_pin.link()
+                        ))
+                        .footer(|footer| {
+                            footer
+                                .text(format!("Message pinned from #{} using LPBot", channel_name))
+                        })
+                        .timestamp(last_pin.timestamp)
+                    }))
+                }
+                embeds.extend(
+                    last_pin
+                        .embeds
+                        .iter()
+                        .filter(|em| em.kind.as_deref() == Some("rich"))
+                        .map(|em| {
+                            Embed::fake(|val| {
+                                em.title.as_ref().map(|title| val.title(title));
+                                em.url.as_ref().map(|url| val.url(url));
+                                em.author.as_ref().map(|author| {
+                                    val.author(|at| {
+                                        author.url.as_ref().map(|url| at.url(url));
+                                        author.icon_url.as_ref().map(|url| at.icon_url(url));
+                                        at.name(&author.name)
+                                    })
+                                });
+                                em.colour.as_ref().map(|colour| val.colour(*colour));
+                                em.description
+                                    .as_ref()
+                                    .map(|description| val.description(description));
+                                em.fields.iter().for_each(|f| {
+                                    val.field(&f.name, &f.value, f.inline);
+                                });
+                                em.footer.as_ref().map(|footer| {
+                                    val.footer(|f| {
+                                        footer.icon_url.as_ref().map(|url| f.icon_url(url));
+                                        f.text(&footer.text)
+                                    })
+                                });
+                                em.image.as_ref().map(|image| val.image(&image.url));
+                                em.thumbnail
+                                    .as_ref()
+                                    .map(|thumbnail| val.thumbnail(&thumbnail.url));
+                                em.timestamp
+                                    .as_deref()
+                                    .map(|timestamp| val.timestamp(timestamp));
+                                val
+                            })
+                        }),
+                );
+                message.embeds(embeds);
+                avatar.map(|av| message.avatar_url(av));
+                message.username(name)
+            })
+            .await
+            .context("calling pinboard webhook")?;
+        last_pin
+            .unpin(&ctx.http)
+            .await
+            .context("deleting pinned message")?;
+        Ok(())
+    }
+}
+
+fn format_options(opts: &[CommandDataOption]) -> String {
+    let mut out = String::new();
+    for (i, opt) in opts.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&opt.name);
+        out.push_str(": ");
+        match &opt.resolved {
+            None => out.push_str("None"),
+            Some(CommandDataOptionValue::String(s)) => write!(&mut out, "{s:?}").unwrap(),
+            Some(val) => write!(&mut out, "{val:?}").unwrap(),
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -408,6 +446,17 @@ impl EventHandler for Handler {
         if let Interaction::Autocomplete(ac) = interaction {
             self.process_autocomplete(&ctx, ac).await.unwrap();
         } else if let Interaction::ApplicationCommand(command) = interaction {
+            // log command
+            let guild_name = command
+                .guild_id
+                .and_then(|g| g.name(&ctx))
+                .map(|name| format!("[{name}] "))
+                .unwrap_or_default();
+            let user = &command.user.name;
+            let name = &command.data.name;
+            let params = format_options(&command.data.options);
+            eprintln!("{guild_name}{user}: /{name} {params}");
+
             let cmd = SlashCommand {
                 handler: self,
                 ctx: &ctx,
@@ -415,18 +464,11 @@ impl EventHandler for Handler {
             };
             let (contents, flags) = match self.process_command(cmd).await {
                 Ok(CommandResponse::None) => return,
-                Ok(CommandResponse::Public(s)) => {
-                    (s, InteractionApplicationCommandCallbackDataFlags::empty())
-                }
-                Ok(CommandResponse::Private(s)) => {
-                    (s, InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-                }
+                Ok(CommandResponse::Public(s)) => (s, MessageFlags::empty()),
+                Ok(CommandResponse::Private(s)) => (s, MessageFlags::EPHEMERAL),
                 Err(e) => {
                     eprintln!("Error processing command {}: {:?}", &command.data.name, e);
-                    (
-                        e.to_string(),
-                        InteractionApplicationCommandCallbackDataFlags::EPHEMERAL,
-                    )
+                    (e.to_string(), MessageFlags::EPHEMERAL)
                 }
             };
 
@@ -491,67 +533,36 @@ impl EventHandler for Handler {
             .collect::<Vec<_>>();
         GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
             commands
+                .create_application_command(|command| reltime::Relative::create(command))
                 .create_application_command(|command| {
-                    command
-                        .name("relative")
-                        .description("Give relative timestamp")
-                        .create_option(|option| {
-                            option
-                                .name("time")
-                                .description("Time of day e.g. 7:30pm EST")
-                                .kind(ApplicationCommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .create_application_command(|command| {
-                    command.name("ping").description("A ping command")
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("bday")
-                        .description("Set your birthday")
-                        .create_option(|option| {
-                            option
-                                .name("day")
-                                .description("Day")
-                                .kind(ApplicationCommandOptionType::Integer)
-                                .min_int_value(1)
-                                .max_int_value(31)
-                                .required(true)
-                        })
-                        .create_option(|option| {
-                            const MONTHS: [&str; 12] = [
-                                "January",
-                                "February",
-                                "March",
-                                "April",
-                                "May",
-                                "June",
-                                "July",
-                                "August",
-                                "September",
-                                "October",
-                                "November",
-                                "December",
-                            ];
-                            option
-                                .name("month")
-                                .description("Month")
-                                .kind(ApplicationCommandOptionType::Integer)
-                                .min_int_value(1)
-                                .max_int_value(12)
-                                .required(true);
-                            MONTHS.iter().enumerate().for_each(|(n, month)| {
-                                option.add_int_choice(month, n as i32 + 1);
-                            });
-                            option
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("year")
-                                .description("Year")
-                                .kind(ApplicationCommandOptionType::Integer)
-                        })
+                    commands::SetBday::create_extras(
+                        command,
+                        |opt_name, opt: &mut CreateApplicationCommandOption| match opt_name {
+                            "day" => {
+                                opt.min_int_value(1).max_int_value(31);
+                            }
+                            "month" => {
+                                const MONTHS: [&str; 12] = [
+                                    "January",
+                                    "February",
+                                    "March",
+                                    "April",
+                                    "May",
+                                    "June",
+                                    "July",
+                                    "August",
+                                    "September",
+                                    "October",
+                                    "November",
+                                    "December",
+                                ];
+                                MONTHS.iter().enumerate().for_each(|(n, month)| {
+                                    opt.add_int_choice(month, n as i32 + 1);
+                                });
+                            }
+                            _ => {}
+                        },
+                    )
                 })
                 .create_application_command(|command| {
                     command.name("bdays").description("List server birthdays")
@@ -567,14 +578,14 @@ impl EventHandler for Handler {
                                 .description(
                                     "The word that will trigger the reaction (case-insensitive)",
                                 )
-                                .kind(ApplicationCommandOptionType::String)
+                                .kind(CommandOptionType::String)
                                 .required(true)
                         })
                         .create_option(|option| {
                             option
                                 .name("emote")
                                 .description("The emote to react with")
-                                .kind(ApplicationCommandOptionType::String)
+                                .kind(CommandOptionType::String)
                                 .required(true)
                         })
                 })
@@ -589,7 +600,7 @@ impl EventHandler for Handler {
                                 .description(
                                     "The word that triggers the reaction (case-insensitive)",
                                 )
-                                .kind(ApplicationCommandOptionType::String)
+                                .kind(CommandOptionType::String)
                                 .required(true)
                                 .set_autocomplete(true)
                         })
@@ -597,138 +608,89 @@ impl EventHandler for Handler {
                             option
                                 .name("emote")
                                 .description("The emote to no longer react with")
-                                .kind(ApplicationCommandOptionType::String)
+                                .kind(CommandOptionType::String)
                                 .required(true)
                                 .set_autocomplete(true)
+                        })
+                })
+                .create_application_command(|command| {
+                    command
+                        .name("magik")
+                        .description("fuck up an image")
+                        .create_option(|option| {
+                            option
+                                .name("url")
+                                .description("Image URL")
+                                .kind(CommandOptionType::String)
+                                .required(true)
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("scale")
+                                .description("Scale")
+                                .kind(CommandOptionType::Number)
+                                .min_number_value(0.00001)
+                                .max_number_value(4.)
                         })
                 })
         })
         .await
         .unwrap();
 
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("lp")
-                .description("Host a listening party")
-                .create_option(|option| {
-                    option
-                        .name("album")
-                        .description("What you will be listening to (e.g. band - album, spotify/bandcamp link)")
-                        .kind(ApplicationCommandOptionType::String)
-                        .required(true)
-                        .set_autocomplete(true)
+        let provider_extra = |opt_name: &str, opt: &mut CreateApplicationCommandOption| {
+            if opt_name == "provider" {
+                providers.iter().for_each(|p| {
+                    opt.add_string_choice(p, p);
                 })
-                .create_option(|option| {
-                    option
-                        .name("time")
-                        .description("Time at which the LP will take place (e.g. XX:20, +5)")
-                        .kind(ApplicationCommandOptionType::String)
-                })
-                .create_option(|option| {
-                    option
-                        .name("link")
-                        .description("(Optional) Link to the album/playlist (Spotify, Youtube, Bandcamp...)")
-                        .kind(ApplicationCommandOptionType::String)
-                        .set_autocomplete(true)
-                })
-                .create_option(|option| {
-                    let opt = option
-                        .name("provider")
-                        .description("Where to look for album info (defaults to spotify)")
-                        .kind(ApplicationCommandOptionType::String);
-                    providers.iter().for_each(|p| {
-                        opt.add_string_choice(p, p);
-                    });
-                    opt
-                })
+            }
+        };
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::lp::Lp::create_extras(command, provider_extra)
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("album")
-                .description("Lookup an album")
-                .create_option(|option| {
-                    option
-                        .name("album")
-                        .description("The album you are looking for (e.g. band - album)")
-                        .kind(ApplicationCommandOptionType::String)
-                        .required(true)
-                })
-                .create_option(|option| {
-                    let opt = option
-                        .name("provider")
-                        .description("Where to look for album info (defaults to spotify)")
-                        .kind(ApplicationCommandOptionType::String);
-                    providers.iter().for_each(|p| {
-                        opt.add_string_choice(p, p);
-                    });
-                    opt
-                })
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::AlbumLookup::create_extras(command, provider_extra)
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("setrole")
-                .description("Set what role to ping for listening parties")
-                .create_option(|option| {
-                    option
-                        .name("role")
-                        .description("Role to ping (leave unset to clear)")
-                        .kind(ApplicationCommandOptionType::Role)
-                })
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::SetLpRole::create(command)
                 .default_member_permissions(Permissions::MANAGE_ROLES)
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("setcreatethreads")
-                .description("Configure whether LPBot should create threads for LPs")
-                .create_option(|option| {
-                    option
-                        .name("create_threads")
-                        .description("Create threads for LPs")
-                        .kind(ApplicationCommandOptionType::Boolean)
-                        .required(true)
-                })
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::SetCreateThreads::create(command)
                 .default_member_permissions(Permissions::MANAGE_THREADS)
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command.name("quote").kind(ApplicationCommandType::Message)
+        Command::create_global_application_command(&ctx.http, |command| {
+            command.name("quote").kind(CommandType::Message)
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("quote")
-                .description("Retrieve a quote")
-                .create_option(|option| {
-                    option
-                        .name("number")
-                        .description("Number the quote was saved as (optional)")
-                        .kind(ApplicationCommandOptionType::Integer)
-                        .min_int_value(1)
-                        .set_autocomplete(true)
-                })
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::GetQuote::create_extras(
+                command,
+                |opt_name, opt: &mut CreateApplicationCommandOption| {
+                    if opt_name == "number" {
+                        opt.min_int_value(1);
+                    }
+                },
+            )
         })
         .await
         .unwrap();
-        ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-            command
-                .name("setwebhook")
-                .description(
-                    "Set (or unset) a webhook for LPBot to use when creating listening parties",
-                )
-                .create_option(|option| {
-                    option
-                        .name("webhook")
-                        .description("The webhook URL (leave empty to remove)")
-                        .kind(ApplicationCommandOptionType::String)
-                })
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::SetWebhook::create(command)
+                .default_member_permissions(Permissions::MANAGE_WEBHOOKS)
+        })
+        .await
+        .unwrap();
+        Command::create_global_application_command(&ctx.http, |command| {
+            commands::SetPinboardWebhook::create(command)
                 .default_member_permissions(Permissions::MANAGE_WEBHOOKS)
         })
         .await
@@ -736,8 +698,27 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
+        if &new_message.content == ".fmcrabdown" {
+            if let Err(e) = self.crabdown(&ctx, new_message.channel_id).await {
+                eprintln!("Error sending countdown: {}", e);
+            }
+            return;
+        }
         if let Err(e) = self.add_reacts(&ctx, new_message).await {
             eprintln!("Error adding reacts: {}", e);
+        }
+    }
+
+    async fn channel_pins_update(&self, ctx: Context, pin: ChannelPinsUpdateEvent) {
+        let guild_id = match pin.guild_id {
+            Some(gid) => gid,
+            None => return,
+        };
+        if let Err(e) = self
+            .move_pin_to_pinboard(&ctx, pin.channel_id, guild_id)
+            .await
+        {
+            eprintln!("Error moving message to pinboard: {}", e);
         }
     }
 }
@@ -764,7 +745,8 @@ async fn main() {
         token,
         GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::GUILD_MESSAGE_REACTIONS
-            | GatewayIntents::MESSAGE_CONTENT,
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILDS,
     )
     .event_handler(handler)
     .application_id(application_id)

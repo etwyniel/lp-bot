@@ -1,4 +1,5 @@
 /target
+serenity-command/target
+serenity-command-derive/target
 token*
 *.sqlite
-env*.sh

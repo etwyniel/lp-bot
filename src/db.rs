@@ -73,6 +73,10 @@ impl Handler {
         self.get_guild_field("webhook", guild_id).await
     }
 
+    pub async fn get_pinboard_webhook(&self, guild_id: u64) -> Option<String> {
+        self.get_guild_field("pinboard_webhook", guild_id).await
+    }
+
     pub async fn add_quote(&self, guild_id: u64, message: &Message) -> anyhow::Result<Option<u64>> {
         let mut db = self.db.lock().await;
         let tx = db.transaction()?;
@@ -217,7 +221,8 @@ pub fn init() -> anyhow::Result<Connection> {
             id INTEGER PRIMARY KEY,
             role_id INTEGER,
             create_threads BOOLEAN NOT NULL DEFAULT(TRUE),
-            webhook STRING
+            webhook STRING,
+            pinboard_webhook STRING
         )",
         [],
     )?;

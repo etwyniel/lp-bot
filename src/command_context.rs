@@ -3,49 +3,26 @@ use serenity::{
     async_trait,
     client::Context,
     model::{
-        channel::{Channel, Message},
-        guild::Role,
-        interactions::application_command::{
-            ApplicationCommandInteraction, ApplicationCommandInteractionDataOption,
-            ApplicationCommandInteractionDataOptionValue,
+        application::interaction::application_command::{
+            CommandDataOption, CommandDataOptionValue,
         },
-        prelude::InteractionApplicationCommandCallbackDataFlags,
+        channel::{Channel, Message},
+        prelude::interaction::application_command::ApplicationCommandInteraction,
     },
 };
 
 use crate::Handler;
 
-pub enum CommandResponse {
-    None,
-    Public(String),
-    Private(String),
-}
-
-impl CommandResponse {
-    fn to_contents_and_flags(
-        self,
-    ) -> Option<(String, InteractionApplicationCommandCallbackDataFlags)> {
-        Some(match self {
-            CommandResponse::None => return None,
-            CommandResponse::Public(s) => {
-                (s, InteractionApplicationCommandCallbackDataFlags::empty())
-            }
-            CommandResponse::Private(s) => {
-                (s, InteractionApplicationCommandCallbackDataFlags::EPHEMERAL)
-            }
-        })
-    }
-}
+use serenity_command::CommandResponse;
 
 #[async_trait]
 pub trait Responder {
     async fn respond(
         &self,
+        ctx: &Context,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>>;
-    fn ctx(&self) -> &Context;
-    fn handler(&self) -> &Handler;
 }
 
 pub struct SlashCommand<'a, 'b> {
@@ -55,9 +32,41 @@ pub struct SlashCommand<'a, 'b> {
 }
 
 #[async_trait]
+impl Responder for ApplicationCommandInteraction {
+    async fn respond(
+        &self,
+        ctx: &Context,
+        contents: CommandResponse,
+        role_id: Option<u64>,
+    ) -> anyhow::Result<Option<Message>> {
+        let (contents, flags) = match contents.to_contents_and_flags() {
+            None => return Ok(None),
+            Some(c) => c,
+        };
+        self
+            .create_interaction_response(&ctx.http, |resp|
+                resp
+                .kind(serenity::model::application::interaction::InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message|
+                    message
+                    .content(&contents)
+                    .flags(flags)
+                    .allowed_mentions(|mentions| mentions.roles(role_id))
+                )
+            ).await?;
+        self
+            .get_interaction_response(&ctx.http)
+            .await
+            .map_err(anyhow::Error::from)
+            .map(Some)
+    }
+}
+
+#[async_trait]
 impl Responder for SlashCommand<'_, '_> {
     async fn respond(
         &self,
+        _ctx: &Context,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>> {
@@ -68,7 +77,7 @@ impl Responder for SlashCommand<'_, '_> {
         self.command
             .create_interaction_response(&self.ctx.http, |resp|
                 resp
-                .kind(serenity::model::interactions::InteractionResponseType::ChannelMessageWithSource)
+                .kind(serenity::model::application::interaction::InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|message|
                     message
                     .content(&contents)
@@ -82,14 +91,6 @@ impl Responder for SlashCommand<'_, '_> {
             .map_err(anyhow::Error::from)
             .map(Some)
     }
-
-    fn ctx(&self) -> &Context {
-        self.ctx
-    }
-
-    fn handler(&self) -> &Handler {
-        self.handler
-    }
 }
 
 impl<'a, 'b> SlashCommand<'a, 'b> {
@@ -100,7 +101,7 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
     fn opt<T>(
         &self,
         name: &str,
-        getter: impl FnOnce(&ApplicationCommandInteractionDataOptionValue) -> Option<T>,
+        getter: impl FnOnce(&CommandDataOptionValue) -> Option<T>,
     ) -> Option<T> {
         match self
             .command
@@ -117,7 +118,7 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
 
     pub fn str_opt(&self, name: &str) -> Option<String> {
         self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::String(s) = o {
+            if let CommandDataOptionValue::String(s) = o {
                 Some(s.clone())
             } else {
                 None
@@ -125,30 +126,10 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         })
     }
 
-    pub fn role_opt(&self, name: &str) -> Option<Role> {
+    pub fn number_opt(&self, name: &str) -> Option<f64> {
         self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::Role(r) = o {
-                Some(r.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn bool_opt(&self, name: &str) -> Option<bool> {
-        self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::Boolean(b) = o {
-                Some(*b)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn int_opt(&self, name: &str) -> Option<i64> {
-        self.opt(name, |o| {
-            if let ApplicationCommandInteractionDataOptionValue::Integer(i) = o {
-                Some(*i)
+            if let CommandDataOptionValue::Number(n) = o {
+                Some(*n)
             } else {
                 None
             }
@@ -166,6 +147,7 @@ pub struct TextCommand<'a, 'b> {
 impl Responder for TextCommand<'_, '_> {
     async fn respond(
         &self,
+        _ctx: &Context,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>> {
@@ -186,20 +168,9 @@ impl Responder for TextCommand<'_, '_> {
             .map_err(anyhow::Error::from)
             .map(Some)
     }
-
-    fn ctx(&self) -> &Context {
-        self.ctx
-    }
-
-    fn handler(&self) -> &Handler {
-        self.handler
-    }
 }
 
-pub fn get_str_opt_ac<'a>(
-    options: &'a [ApplicationCommandInteractionDataOption],
-    name: &str,
-) -> Option<&'a str> {
+pub fn get_str_opt_ac<'a>(options: &'a [CommandDataOption], name: &str) -> Option<&'a str> {
     options
         .iter()
         .find(|opt| opt.name == name)
@@ -207,7 +178,17 @@ pub fn get_str_opt_ac<'a>(
         .and_then(|val| val.as_str())
 }
 
-pub fn get_focused_option(options: &[ApplicationCommandInteractionDataOption]) -> Option<&str> {
+#[allow(unused)]
+pub fn get_int_opt_ac(options: &[CommandDataOption], name: &str) -> Option<i64> {
+    options
+        .iter()
+        .find(|opt| opt.name == name)?
+        .value
+        .as_ref()?
+        .as_i64()
+}
+
+pub fn get_focused_option(options: &[CommandDataOption]) -> Option<&str> {
     options
         .iter()
         .find(|opt| opt.focused)

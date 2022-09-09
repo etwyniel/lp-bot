@@ -5,12 +5,38 @@ use std::ops::Add;
 use anyhow::bail;
 use chrono::{prelude::*, Duration};
 use regex::Regex;
+use serenity::async_trait;
+use serenity::client::Context;
+use serenity::model::application::interaction::application_command::CommandDataOption;
 use serenity::model::channel::ChannelType;
-use serenity::model::interactions::application_command::ApplicationCommandInteractionDataOption;
+use serenity::model::id::GuildId;
+use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity_command_derive::Command;
 
 use crate::album::Album;
-use crate::command_context::{get_focused_option, get_str_opt_ac, CommandResponse, Responder};
-use crate::{command_context::SlashCommand, Handler};
+use crate::command_context::{get_focused_option, get_str_opt_ac, Responder};
+use crate::Handler;
+use crate::{BotCommand, InteractionExt};
+use serenity_command::CommandResponse;
+
+#[derive(Command)]
+#[cmd(name = "lp", desc = "run a listening party", data = "Handler")]
+pub struct Lp {
+    #[cmd(
+        desc = "What you will be listening to (e.g. band - album, spotify/bandcamp link)",
+        autocomplete
+    )]
+    album: String,
+    #[cmd(
+        desc = "(Optional) Link to the album/playlist (Spotify, Youtube, Bandcamp...)",
+        autocomplete
+    )]
+    link: Option<String>,
+    #[cmd(desc = "Time at which the LP will take place (e.g. XX:20, +5)")]
+    time: Option<String>,
+    #[cmd(desc = "Where to look for album info (defaults to spotify)")]
+    provider: Option<String>,
+}
 
 fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
     let time = match time {
@@ -85,14 +111,21 @@ async fn build_message_contents(
     Ok(resp_content)
 }
 
-impl<'a, 'b> SlashCommand<'a, 'b> {
-    pub async fn run_lp(
-        &self,
-        mut lp_name: Option<String>,
-        mut link: Option<String>,
-        time: Option<String>,
-        provider: Option<String>,
-    ) -> anyhow::Result<()> {
+#[async_trait]
+impl BotCommand for Lp {
+    async fn run(
+        self,
+        handler: &Handler,
+        ctx: &Context,
+        command: &ApplicationCommandInteraction,
+    ) -> anyhow::Result<CommandResponse> {
+        let Lp {
+            album,
+            mut link,
+            time,
+            provider,
+        } = self;
+        let mut lp_name = Some(album);
         if lp_name.as_deref().map(|name| name.starts_with("https://")) == Some(true) {
             // As a special case for convenience, if we have a URL in lp_name, use that as link
             if link.is_some() && link != lp_name {
@@ -101,8 +134,7 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
                 link = lp_name.take();
             }
         }
-        let handler = self.handler;
-        let http = &self.ctx.http;
+        let http = &ctx.http;
         // Depending on what we have, look up more information
         let mut info = match (&lp_name, &link) {
             (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
@@ -124,7 +156,7 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             info.genres = genres
         }
 
-        let guild_id = self.command.guild_id.unwrap().0;
+        let guild_id = command.guild_id()?.0;
         let role_id = handler.get_role_id(guild_id).await;
         let resp_content =
             build_message_contents(lp_name.as_deref(), &info, time.as_deref(), role_id).await?;
@@ -136,8 +168,12 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         let message = if let Some(wh) = &wh {
             // Send LP message through webhook
             // This lets us impersonate the user who sent the command
-            let user = &self.command.user;
-            let avatar_url = user.avatar_url();
+            let user = &command.user;
+            let avatar_url = GuildId(guild_id)
+                .member(http, user)
+                .await?
+                .avatar_url()
+                .or_else(|| user.avatar_url());
             let nick = user // try to get the user's nickname
                 .nick_in(http, guild_id)
                 .await
@@ -154,13 +190,14 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
             .unwrap() // Message is present because we set wait to true in execute
         } else {
             // Create interaction response
-            self.respond(CommandResponse::Public(resp_content), role_id)
+            command
+                .respond(ctx, CommandResponse::Public(resp_content), role_id)
                 .await?
                 .unwrap()
         };
         let mut response = format!(
             "LP created: {}",
-            message.id.link(message.channel_id, self.command.guild_id)
+            message.id.link(message.channel_id, command.guild_id)
         );
         if handler.get_create_threads(guild_id).await {
             // Create a thread from the response message for the LP to take place in
@@ -186,21 +223,21 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
         }
         if let Some(wh) = wh {
             // If we used a webhook, we still need to create the interaction response
-            let response = if wh.channel_id == Some(self.command.channel_id) {
+            let response = if wh.channel_id == Some(command.channel_id) {
                 CommandResponse::Private(response)
             } else {
                 CommandResponse::Public(response)
             };
-            self.respond(response, None).await?;
+            command.respond(ctx, response, None).await?;
         }
-        Ok(())
+        Ok(CommandResponse::None)
     }
 }
 
 impl Handler {
     pub async fn autocomplete_lp(
         &self,
-        options: &[ApplicationCommandInteractionDataOption],
+        options: &[CommandDataOption],
     ) -> anyhow::Result<Vec<(String, String)>> {
         let mut choices = vec![];
         let mut provider = get_str_opt_ac(options, "provider");
