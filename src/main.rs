@@ -38,6 +38,7 @@ mod commands;
 mod db;
 mod lastfm;
 mod magik;
+mod pinboard;
 mod reltime;
 mod spotify;
 
@@ -275,11 +276,13 @@ impl Handler {
     }
 
     async fn crabdown(&self, ctx: &Context, channel: ChannelId) -> anyhow::Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
         for i in 0..3 {
             channel
                 .send_message(&ctx.http, |msg| msg.content("🦀".repeat(3 - i)))
                 .await?;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            interval.tick().await;
         }
         channel
             .send_message(&ctx.http, |msg| {
@@ -289,118 +292,20 @@ impl Handler {
         Ok(())
     }
 
-    async fn move_pin_to_pinboard(
+    #[allow(unused)]
+    async fn delete_guild_commands(
         &self,
         ctx: &Context,
-        channel: ChannelId,
-        guild_id: GuildId,
+        guilds: impl Iterator<Item = GuildId>,
+        command_names: &[&str],
     ) -> anyhow::Result<()> {
-        let pins = channel
-            .pins(&ctx.http)
-            .await
-            .context("getting pinned messages")?;
-        let last_pin = match pins.last() {
-            Some(m) => m,
-            _ => return Ok(()),
-        };
-        dbg!(&last_pin);
-        let pinboard_webhook = match self.get_pinboard_webhook(guild_id.0).await {
-            Some(w) => w,
-            _ => return Ok(()),
-        };
-        let author = &last_pin.author;
-        let name = last_pin
-            .author_nick(&ctx.http)
-            .await
-            .unwrap_or_else(|| author.name.clone());
-        let avatar = guild_id
-            .member(&ctx.http, author)
-            .await
-            .ok()
-            .and_then(|member| member.avatar)
-            .filter(|av| av.starts_with("http"))
-            .or_else(|| author.avatar_url())
-            .filter(|av| av.starts_with("http"));
-        let channel_name = channel
-            .name(&ctx)
-            .await
-            .unwrap_or_else(|| "unknown-channel".to_string());
-        let image = last_pin
-            .attachments
-            .iter()
-            .find(|at| at.height.is_some())
-            .map(|at| at.url.as_str());
-        ctx.http
-            .get_webhook_from_url(&pinboard_webhook)
-            .await
-            .context("getting webhook")?
-            .execute(&ctx.http, true, |message| {
-                let mut embeds = Vec::with_capacity(last_pin.embeds.len() + 1);
-                if !last_pin.content.is_empty() || image.is_some() {
-                    embeds.push(Embed::fake(|val| {
-                        image.map(|url| val.image(url));
-                        val.description(format!(
-                            "{}\n\n[(Source)]({})",
-                            last_pin.content,
-                            last_pin.link()
-                        ))
-                        .footer(|footer| {
-                            footer
-                                .text(format!("Message pinned from #{} using LPBot", channel_name))
-                        })
-                        .timestamp(last_pin.timestamp)
-                    }))
+        for g in guilds {
+            for cmd in g.get_application_commands(&ctx.http).await? {
+                if command_names.contains(&cmd.name.as_str()) {
+                    g.delete_application_command(&ctx.http, cmd.id).await?;
                 }
-                embeds.extend(
-                    last_pin
-                        .embeds
-                        .iter()
-                        .filter(|em| em.kind.as_deref() == Some("rich"))
-                        .map(|em| {
-                            Embed::fake(|val| {
-                                em.title.as_ref().map(|title| val.title(title));
-                                em.url.as_ref().map(|url| val.url(url));
-                                em.author.as_ref().map(|author| {
-                                    val.author(|at| {
-                                        author.url.as_ref().map(|url| at.url(url));
-                                        author.icon_url.as_ref().map(|url| at.icon_url(url));
-                                        at.name(&author.name)
-                                    })
-                                });
-                                em.colour.as_ref().map(|colour| val.colour(*colour));
-                                em.description
-                                    .as_ref()
-                                    .map(|description| val.description(description));
-                                em.fields.iter().for_each(|f| {
-                                    val.field(&f.name, &f.value, f.inline);
-                                });
-                                em.footer.as_ref().map(|footer| {
-                                    val.footer(|f| {
-                                        footer.icon_url.as_ref().map(|url| f.icon_url(url));
-                                        f.text(&footer.text)
-                                    })
-                                });
-                                em.image.as_ref().map(|image| val.image(&image.url));
-                                em.thumbnail
-                                    .as_ref()
-                                    .map(|thumbnail| val.thumbnail(&thumbnail.url));
-                                em.timestamp
-                                    .as_deref()
-                                    .map(|timestamp| val.timestamp(timestamp));
-                                val
-                            })
-                        }),
-                );
-                message.embeds(embeds);
-                avatar.map(|av| message.avatar_url(av));
-                message.username(name)
-            })
-            .await
-            .context("calling pinboard webhook")?;
-        last_pin
-            .unpin(&ctx.http)
-            .await
-            .context("deleting pinned message")?;
+            }
+        }
         Ok(())
     }
 }
@@ -444,14 +349,13 @@ impl EventHandler for Handler {
                 ctx: &ctx,
                 command: &command,
             };
-            let (contents, flags) = match self.process_command(cmd).await {
+            let resp = self.process_command(cmd).await;
+            eprintln!("{guild_name}{user}: /{name} -> {:?}", &resp);
+            let (contents, flags) = match resp {
                 Ok(CommandResponse::None) => return,
                 Ok(CommandResponse::Public(s)) => (s, MessageFlags::empty()),
                 Ok(CommandResponse::Private(s)) => (s, MessageFlags::EPHEMERAL),
-                Err(e) => {
-                    eprintln!("Error processing command {}: {:?}", &command.data.name, e);
-                    (e.to_string(), MessageFlags::EPHEMERAL)
-                }
+                Err(e) => (e.to_string(), MessageFlags::EPHEMERAL),
             };
 
             if let Err(why) = command
@@ -462,7 +366,7 @@ impl EventHandler for Handler {
                 })
                 .await
             {
-                eprintln!("cannot respond to slash command: {}", why);
+                eprintln!("cannot respond to slash command: {:?}", why);
                 return;
             }
         }
@@ -481,7 +385,7 @@ impl EventHandler for Handler {
                 Ok(Some(n)) => n,
                 Ok(None) => return,
                 Err(e) => {
-                    eprintln!("Error adding quote: {}", e);
+                    eprintln!("Error adding quote: {:?}", e);
                     return;
                 }
             };
@@ -498,7 +402,11 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        println!(
+            "{} is connected to {} guilds!",
+            ready.user.name,
+            ready.guilds.len()
+        );
 
         let guild_id = GuildId(
             env::var("GUILD_ID")
@@ -557,62 +465,34 @@ impl EventHandler for Handler {
         .await
         .unwrap();
         Command::create_global_application_command(&ctx.http, |command| {
-            commands::AlbumLookup::create_extras(command, provider_extra)
-        })
-        .await
-        .unwrap();
-        Command::create_global_application_command(&ctx.http, |command| {
-            commands::SetLpRole::create(command)
-                .default_member_permissions(Permissions::MANAGE_ROLES)
-        })
-        .await
-        .unwrap();
-        Command::create_global_application_command(&ctx.http, |command| {
-            commands::SetCreateThreads::create(command)
-                .default_member_permissions(Permissions::MANAGE_THREADS)
-        })
-        .await
-        .unwrap();
-        Command::create_global_application_command(&ctx.http, |command| {
             command.name("quote").kind(CommandType::Message)
         })
         .await
         .unwrap();
         Command::create_global_application_command(&ctx.http, |command| {
-            commands::GetQuote::create_extras(
-                command,
-                |opt_name, opt: &mut CreateApplicationCommandOption| {
-                    if opt_name == "number" {
-                        opt.min_int_value(1);
-                    }
-                },
-            )
+            commands::GetQuote::runner().register(command)
         })
         .await
         .unwrap();
-        Command::create_global_application_command(&ctx.http, |command| {
-            commands::SetWebhook::create(command)
-                .default_member_permissions(Permissions::MANAGE_WEBHOOKS)
-        })
-        .await
-        .unwrap();
-        Command::create_global_application_command(&ctx.http, |command| {
-            commands::SetPinboardWebhook::create(command)
-                .default_member_permissions(Permissions::MANAGE_WEBHOOKS)
-        })
-        .await
-        .unwrap();
+
+        for runner in self.commands.read().await.values() {
+            Command::create_global_application_command(&ctx.http, |command| {
+                runner.register(command)
+            })
+            .await
+            .unwrap();
+        }
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
         if &new_message.content == ".fmcrabdown" {
             if let Err(e) = self.crabdown(&ctx, new_message.channel_id).await {
-                eprintln!("Error sending countdown: {}", e);
+                eprintln!("Error sending countdown: {:?}", e);
             }
             return;
         }
         if let Err(e) = self.add_reacts(&ctx, new_message).await {
-            eprintln!("Error adding reacts: {}", e);
+            eprintln!("Error adding reacts: {:?}", e);
         }
     }
 
@@ -625,7 +505,7 @@ impl EventHandler for Handler {
             .move_pin_to_pinboard(&ctx, pin.channel_id, guild_id)
             .await
         {
-            eprintln!("Error moving message to pinboard: {}", e);
+            eprintln!("Error moving message to pinboard: {:?}", e);
         }
     }
 }
@@ -635,7 +515,7 @@ async fn main() {
     let handler = match Handler::new().await {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("Initialization failed: {}", e);
+            eprintln!("Initialization failed: {:?}", e);
             return;
         }
     };

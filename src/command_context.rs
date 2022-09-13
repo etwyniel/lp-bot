@@ -54,8 +54,7 @@ impl Responder for ApplicationCommandInteraction {
                     .allowed_mentions(|mentions| mentions.roles(role_id))
                 )
             ).await?;
-        self
-            .get_interaction_response(&ctx.http)
+        self.get_interaction_response(&ctx.http)
             .await
             .map_err(anyhow::Error::from)
             .map(Some)

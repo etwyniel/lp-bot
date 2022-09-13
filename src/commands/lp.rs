@@ -62,7 +62,7 @@ fn convert_lp_time(time: Option<&str>) -> Result<String, anyhow::Error> {
         let extra_mins: i64 = cap.get(1).unwrap().as_str().parse()?;
         lp_time = lp_time.add(Duration::minutes(extra_mins));
     } else {
-        bail!("Invalid time: {}", time);
+        return Ok(time.to_string());
     }
 
     // timestamp and relative time
