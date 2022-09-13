@@ -4,16 +4,15 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use album::Album;
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{anyhow, bail};
 use autoreact::ReactsCache;
 use chrono::{Datelike, Utc};
-use commands::BotCommand;
 use lastfm::Lastfm;
 use rusqlite::Connection;
 use serenity::builder::CreateApplicationCommandOption;
 use serenity::model::application::command::CommandType;
 use serenity::model::application::interaction::autocomplete::AutocompleteInteraction;
-use serenity::model::channel::{Channel, Embed};
+use serenity::model::channel::Channel;
 use serenity::model::event::ChannelPinsUpdateEvent;
 use serenity::model::id::ChannelId;
 use serenity::model::prelude::interaction::application_command::{
@@ -28,7 +27,6 @@ use serenity::{
         gateway::GatewayIntents,
         gateway::Ready,
         id::GuildId,
-        permissions::Permissions,
     },
     prelude::*,
 };
@@ -47,7 +45,7 @@ use album::AlbumProvider;
 use bandcamp::Bandcamp;
 use command_context::{get_focused_option, get_str_opt_ac, SlashCommand};
 use db::Birthday;
-use serenity_command::{CommandBuilder, CommandResponse, CommandRunner};
+use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
 use spotify::Spotify;
 use tokio::sync;
 
@@ -189,22 +187,6 @@ impl Handler {
                     })
                     .await?;
                 Ok(CommandResponse::None)
-            }
-            "add_autoreact" => {
-                let trigger = cmd.str_opt("trigger").unwrap().to_lowercase();
-                let emote = cmd.str_opt("emote").unwrap();
-                cmd.handler
-                    .add_autoreact(guild_id, &trigger, &emote)
-                    .await?;
-                Ok(CommandResponse::Private("Autoreact added".to_string()))
-            }
-            "remove_autoreact" => {
-                let trigger = cmd.str_opt("trigger").unwrap().to_lowercase();
-                let emote = cmd.str_opt("emote").unwrap();
-                cmd.handler
-                    .remove_autoreact(guild_id, &trigger, &emote)
-                    .await?;
-                Ok(CommandResponse::Private("Autoreact removed".to_string()))
             }
             "magik" => {
                 let url = cmd.str_opt("url").unwrap();
@@ -534,84 +516,9 @@ impl EventHandler for Handler {
         GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
             commands
                 .create_application_command(|command| reltime::Relative::create(command))
-                .create_application_command(|command| {
-                    commands::SetBday::create_extras(
-                        command,
-                        |opt_name, opt: &mut CreateApplicationCommandOption| match opt_name {
-                            "day" => {
-                                opt.min_int_value(1).max_int_value(31);
-                            }
-                            "month" => {
-                                const MONTHS: [&str; 12] = [
-                                    "January",
-                                    "February",
-                                    "March",
-                                    "April",
-                                    "May",
-                                    "June",
-                                    "July",
-                                    "August",
-                                    "September",
-                                    "October",
-                                    "November",
-                                    "December",
-                                ];
-                                MONTHS.iter().enumerate().for_each(|(n, month)| {
-                                    opt.add_int_choice(month, n as i32 + 1);
-                                });
-                            }
-                            _ => {}
-                        },
-                    )
-                })
+                .create_application_command(|command| commands::SetBday::runner().register(command))
                 .create_application_command(|command| {
                     command.name("bdays").description("List server birthdays")
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("add_autoreact")
-                        .description("Automatically add reactions to messages")
-                        .default_member_permissions(Permissions::MANAGE_EMOJIS_AND_STICKERS)
-                        .create_option(|option| {
-                            option
-                                .name("trigger")
-                                .description(
-                                    "The word that will trigger the reaction (case-insensitive)",
-                                )
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("emote")
-                                .description("The emote to react with")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("remove_autoreact")
-                        .description("Remove automatic reaction")
-                        .default_member_permissions(Permissions::MANAGE_MESSAGES)
-                        .create_option(|option| {
-                            option
-                                .name("trigger")
-                                .description(
-                                    "The word that triggers the reaction (case-insensitive)",
-                                )
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                                .set_autocomplete(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("emote")
-                                .description("The emote to no longer react with")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                                .set_autocomplete(true)
-                        })
                 })
                 .create_application_command(|command| {
                     command

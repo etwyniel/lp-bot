@@ -20,7 +20,7 @@ use crate::{BotCommand, InteractionExt};
 use serenity_command::CommandResponse;
 
 #[derive(Command)]
-#[cmd(name = "lp", desc = "run a listening party", data = "Handler")]
+#[cmd(name = "lp", desc = "run a listening party")]
 pub struct Lp {
     #[cmd(
         desc = "What you will be listening to (e.g. band - album, spotify/bandcamp link)",
@@ -113,6 +113,7 @@ async fn build_message_contents(
 
 #[async_trait]
 impl BotCommand for Lp {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,

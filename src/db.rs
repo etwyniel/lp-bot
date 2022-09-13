@@ -148,11 +148,20 @@ impl Handler {
         }
     }
 
-    pub async fn get_random_quote(&self, guild_id: u64) -> anyhow::Result<Option<Quote>> {
+    pub async fn get_random_quote(
+        &self,
+        guild_id: u64,
+        user: Option<u64>,
+    ) -> anyhow::Result<Option<Quote>> {
         let number = {
             let db = self.db.lock().await;
-            let mut stmt = db.prepare("SELECT quote_number FROM quote WHERE guild_id = ?1")?;
-            let numbers: Vec<u64> = stmt.query([guild_id])?.map(|row| row.get(0)).collect()?;
+            let mut stmt = db.prepare(
+                "SELECT quote_number FROM quote WHERE guild_id = ?1 AND (?2 IS NULL OR author_id = ?2)",
+                )?;
+            let numbers: Vec<_> = stmt
+                .query(params![guild_id, user])?
+                .map(|row| row.get(0))
+                .collect()?;
             if numbers.is_empty() {
                 bail!("No quotes saved");
             }

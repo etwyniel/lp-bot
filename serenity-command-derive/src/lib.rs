@@ -99,26 +99,30 @@ fn analyze_field(
                 .collect::<Vec<_>>()
                 .join("::");
             if segs.len() == 1 {
-                let (variant, kind) = match parts.as_str() {
+                let (matcher, kind) = match parts.as_str() {
                     "String" | "std::str::String" => (
-                        quote!(#opt_value::String),
+                        quote!(#opt_value::String(v)),
                         quote!(serenity::model::application::command::CommandOptionType::String),
                     ),
                     "i64" => (
-                        quote!(#opt_value::Integer),
+                        quote!(#opt_value::Integer(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Integer),
                     ),
                     "f64" => (
-                        quote!(#opt_value::Number),
+                        quote!(#opt_value::Number(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Number),
                     ),
                     "bool" => (
-                        quote!(#opt_value::Boolean),
+                        quote!(#opt_value::Boolean(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Boolean),
                     ),
                     "Role" | "serenity::model::guild::Role" => (
-                        quote!(#opt_value::Role),
+                        quote!(#opt_value::Role(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Role),
+                    ),
+                    "User" | "serenity::model::User" => (
+                        quote!(#opt_value::User(v, _)),
+                        quote!(serenity::model::application::command::CommandOptionType::User),
                     ),
                     other => {
                         return Err(syn::Error::new(
@@ -128,13 +132,13 @@ fn analyze_field(
                     }
                 };
                 let getter = if required {
-                    quote!(if let Some(#variant(v)) = #find_opt {
+                    quote!(if let Some(#matcher) = #find_opt {
                         v.clone()
                     } else {
                         panic!("Value is required")
                     })
                 } else {
-                    quote!(if let Some(#variant(v)) = #find_opt {
+                    quote!(if let Some(#matcher) = #find_opt {
                         Some(v.clone())
                     } else {
                         None
@@ -216,13 +220,11 @@ fn derive(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(|f| analyze_field(f.ident.as_ref().unwrap(), &f.ty, &f.attrs))
         .collect::<syn::Result<_>>()?;
-    let data_type = get_attr_value(&attrs, "data")?
-        .ok_or_else(|| syn::Error::new(ident.span(), "Attribute 'data' is required"))?;
-    let data_ident = Ident::new(&data_type, Span::call_site());
     let builders = opts.iter().map(CommandOption::create);
     let getters = opts.iter().map(|o| &o.getter);
     let runner_ident = Ident::new(&format!("__{}_runner", &ident), Span::call_site());
     let app_command = quote!(serenity::model::application::interaction::application_command);
+    let data_ident = quote!(<#ident as serenity_command::BotCommand>::Data);
     Ok(quote!(
             impl<'a> From<&'a #app_command::CommandData> for #ident {
                 fn from(opts: &'a #app_command::CommandData) -> Self {
@@ -241,16 +243,25 @@ fn derive(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     data: &#data_ident,
                     ctx: &serenity::prelude::Context,
                     interaction: &#app_command::ApplicationCommandInteraction,
-                ) -> anyhow::Result<serenity_command::CommandResponse> {
+                    ) -> anyhow::Result<serenity_command::CommandResponse> {
                     #ident::from(&interaction.data).run(data, ctx, interaction).await
                 }
 
                 fn name(&self) -> &'static str {
                     #name
                 }
+
+                fn register<'a>(&self, builder: &'a mut serenity::builder::CreateApplicationCommand) -> &'a mut serenity::builder::CreateApplicationCommand {
+                    use serenity_command::CommandBuilder;
+                    #ident::create_extras(builder, <#ident as serenity_command::BotCommand>::setup_options);
+                    if !#ident::PERMISSIONS.is_empty() {
+                        builder.default_member_permissions(#ident::PERMISSIONS);
+                    }
+                    builder
+                }
             }
 
-        impl<'a> serenity_command::CommandBuilder<'a, #data_ident> for #ident {
+        impl<'a> serenity_command::CommandBuilder<'a> for #ident {
         fn create_extras<E: Fn(&'static str, &mut serenity::builder::CreateApplicationCommandOption)>(
             builder: &mut serenity::builder::CreateApplicationCommand,
             extras: E
@@ -269,7 +280,7 @@ fn derive(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
         const NAME: &'static str = #name;
 
-        fn runner() -> Box<dyn serenity_command::CommandRunner<#data_ident> + Send + Sync> {
+        fn runner() -> Box<dyn serenity_command::CommandRunner<Self::Data> + Send + Sync> {
             Box::new(#runner_ident)
         }
     }))

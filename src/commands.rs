@@ -1,33 +1,26 @@
+use serenity::builder::CreateApplicationCommandOption;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::user::User;
+use serenity::model::Permissions;
 use serenity::{
     async_trait,
     model::prelude::{interaction::InteractionResponseType, GuildId, Role, UserId},
     prelude::Context,
 };
-use serenity_command::{CommandBuilder, CommandResponse, CommandRunner};
+use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
 use serenity_command_derive::Command;
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::Handler;
 use crate::reltime::Relative;
+use crate::Handler;
 
 use anyhow::{anyhow, bail};
 
 pub mod lp;
 
 use lp::Lp;
-
-#[async_trait]
-pub trait BotCommand {
-    async fn run(
-        self,
-        handler: &Handler,
-        ctx: &Context,
-        interaction: &ApplicationCommandInteraction,
-    ) -> anyhow::Result<CommandResponse>;
-}
 
 trait InteractionExt {
     fn guild_id(&self) -> anyhow::Result<GuildId>;
@@ -41,7 +34,7 @@ impl InteractionExt for ApplicationCommandInteraction {
 }
 
 #[derive(Command)]
-#[cmd(name = "album", desc = "lookup an album", data = "Handler")]
+#[cmd(name = "album", desc = "lookup an album")]
 pub struct AlbumLookup {
     #[cmd(desc = "The album you are looking for (e.g. band - album)")]
     album: String,
@@ -51,6 +44,7 @@ pub struct AlbumLookup {
 
 #[async_trait]
 impl BotCommand for AlbumLookup {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -86,11 +80,7 @@ impl BotCommand for AlbumLookup {
 }
 
 #[derive(Command)]
-#[cmd(
-    name = "setrole",
-    desc = "set what role to ping for listening parties",
-    data = "Handler"
-)]
+#[cmd(name = "setrole", desc = "set what role to ping for listening parties")]
 pub struct SetLpRole {
     #[cmd(desc = "Role to ping (leave unset to clear)")]
     role: Option<Role>,
@@ -98,6 +88,7 @@ pub struct SetLpRole {
 
 #[async_trait]
 impl BotCommand for SetLpRole {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -106,7 +97,7 @@ impl BotCommand for SetLpRole {
     ) -> anyhow::Result<CommandResponse> {
         handler
             .set_guild_field(
-                "role",
+                "role_id",
                 opts.guild_id()?.0,
                 self.role.as_ref().map(|r| r.id.0),
             )
@@ -117,13 +108,14 @@ impl BotCommand for SetLpRole {
         };
         Ok(CommandResponse::Public(contents))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_ROLES;
 }
 
 #[derive(Command)]
 #[cmd(
     name = "setcreatethreads",
-    desc = "Configure whether LPBot should create threads for LPs",
-    data = "Handler"
+    desc = "Configure whether LPBot should create threads for LPs"
 )]
 pub struct SetCreateThreads {
     #[cmd(desc = "Create threads for LPs")]
@@ -132,6 +124,7 @@ pub struct SetCreateThreads {
 
 #[async_trait]
 impl BotCommand for SetCreateThreads {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -155,17 +148,22 @@ impl BotCommand for SetCreateThreads {
         );
         Ok(CommandResponse::Public(contents))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_THREADS;
 }
 
 #[derive(Command)]
-#[cmd(name = "quote", desc = "Retrieve a quote", data = "Handler")]
+#[cmd(name = "quote", desc = "Retrieve a quote")]
 pub struct GetQuote {
     #[cmd(desc = "Number the quote was saved as (optional)", autocomplete)]
     number: Option<i64>,
+    #[cmd(desc = "Get a random quote from a specific user")]
+    user: Option<User>,
 }
 
 #[async_trait]
 impl BotCommand for GetQuote {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -176,7 +174,9 @@ impl BotCommand for GetQuote {
         let quote = if let Some(quote_number) = self.number {
             handler.fetch_quote(guild_id, quote_number as u64).await?
         } else {
-            handler.get_random_quote(guild_id).await?
+            handler
+                .get_random_quote(guild_id, self.user.map(|u| u.id.0))
+                .await?
         }
         .ok_or_else(|| anyhow!("No such quote"))?;
         let message_url = format!(
@@ -210,13 +210,18 @@ impl BotCommand for GetQuote {
         .await?;
         Ok(CommandResponse::None)
     }
+
+    fn setup_options(opt_name: &'static str, opt: &mut CreateApplicationCommandOption) {
+        if opt_name == "number" {
+            opt.min_int_value(1);
+        }
+    }
 }
 
 #[derive(Command)]
 #[cmd(
     name = "setwebhook",
-    desc = "Set (or unset) a webhook for LPBot to use when creating listening parties",
-    data = "Handler"
+    desc = "Set (or unset) a webhook for LPBot to use when creating listening parties"
 )]
 pub struct SetWebhook {
     #[cmd(desc = "The webhook URL (leave empty to remove)")]
@@ -225,6 +230,7 @@ pub struct SetWebhook {
 
 #[async_trait]
 impl BotCommand for SetWebhook {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -240,13 +246,14 @@ impl BotCommand for SetWebhook {
         );
         Ok(CommandResponse::Private(contents))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_WEBHOOKS;
 }
 
 #[derive(Command)]
 #[cmd(
     name = "setpinboardwebhook",
-    desc = "Set (or unset) a webhook for the pinboard channel",
-    data = "Handler"
+    desc = "Set (or unset) a webhook for the pinboard channel"
 )]
 pub struct SetPinboardWebhook {
     #[cmd(desc = "The webhook URL for the pinboard channel (leave empty to remove)")]
@@ -255,6 +262,7 @@ pub struct SetPinboardWebhook {
 
 #[async_trait]
 impl BotCommand for SetPinboardWebhook {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -274,10 +282,12 @@ impl BotCommand for SetPinboardWebhook {
             .to_string(),
         ))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_WEBHOOKS;
 }
 
 #[derive(Command)]
-#[cmd(name = "bday", desc = "Set your birthday", data = "Handler")]
+#[cmd(name = "bday", desc = "Set your birthday")]
 pub struct SetBday {
     #[cmd(desc = "Day")]
     day: i64,
@@ -289,6 +299,7 @@ pub struct SetBday {
 
 #[async_trait]
 impl BotCommand for SetBday {
+    type Data = Handler;
     async fn run(
         self,
         handler: &Handler,
@@ -307,10 +318,106 @@ impl BotCommand for SetBday {
             .await?;
         Ok(CommandResponse::Private("Birthday set!".to_string()))
     }
+
+    fn setup_options(opt_name: &'static str, opt: &mut CreateApplicationCommandOption) {
+        match opt_name {
+            "day" => {
+                opt.min_int_value(1).max_int_value(31);
+            }
+            "month" => {
+                const MONTHS: [&str; 12] = [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ];
+                MONTHS.iter().enumerate().for_each(|(n, month)| {
+                    opt.add_int_choice(month, n as i32 + 1);
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
-pub fn register_commands(commands: &mut HashMap<&'static str, Box< dyn CommandRunner<Handler> + Send + Sync>>) {
-    let mut add = |runner: Box<dyn CommandRunner<Handler> + Send + Sync>| commands.insert(runner.name(), runner);
+#[derive(Command)]
+#[cmd(
+    name = "add_autoreact",
+    desc = "Automatically add reactions to messages"
+)]
+pub struct AddAutoreact {
+    #[cmd(desc = "The word that will trigger the reaction (case-insensitive)")]
+    trigger: String,
+    #[cmd(desc = "The emote to react with")]
+    emote: String,
+}
+
+#[async_trait]
+impl BotCommand for AddAutoreact {
+    type Data = Handler;
+    async fn run(
+        self,
+        handler: &Handler,
+        _ctx: &Context,
+        opts: &ApplicationCommandInteraction,
+    ) -> anyhow::Result<CommandResponse> {
+        handler
+            .add_autoreact(
+                opts.guild_id()?.0,
+                &self.trigger.to_lowercase(),
+                &self.emote,
+            )
+            .await?;
+        Ok(CommandResponse::Private("Autoreact added".to_string()))
+    }
+}
+
+#[derive(Command)]
+#[cmd(name = "remove_autoreact", desc = "Remove automatic reaction")]
+pub struct RemoveAutoreact {
+    #[cmd(
+        desc = "The word that triggers the reaction (case-insensitive)",
+        autocomplete
+    )]
+    trigger: String,
+    #[cmd(desc = "The emote to stop reacting with", autocomplete)]
+    emote: String,
+}
+
+#[async_trait]
+impl BotCommand for RemoveAutoreact {
+    type Data = Handler;
+    async fn run(
+        self,
+        handler: &Handler,
+        _ctx: &Context,
+        opts: &ApplicationCommandInteraction,
+    ) -> anyhow::Result<CommandResponse> {
+        handler
+            .remove_autoreact(
+                opts.guild_id()?.0,
+                &self.trigger.to_lowercase(),
+                &self.emote,
+            )
+            .await?;
+        Ok(CommandResponse::Private("Autoreact removed".to_string()))
+    }
+}
+
+pub fn register_commands(
+    commands: &mut HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>,
+) {
+    let mut add = |runner: Box<dyn CommandRunner<Handler> + Send + Sync>| {
+        commands.insert(runner.name(), runner)
+    };
     add(Lp::runner());
     add(AlbumLookup::runner());
     add(SetLpRole::runner());
@@ -319,4 +426,6 @@ pub fn register_commands(commands: &mut HashMap<&'static str, Box< dyn CommandRu
     add(SetPinboardWebhook::runner());
     add(SetBday::runner());
     add(Relative::runner());
+    add(AddAutoreact::runner());
+    add(RemoveAutoreact::runner());
 }
