@@ -192,7 +192,7 @@ impl BotCommand for Lp {
         } else {
             // Create interaction response
             command
-                .respond(ctx, CommandResponse::Public(resp_content), role_id)
+                .respond(&ctx.http, CommandResponse::Public(resp_content), role_id)
                 .await?
                 .unwrap()
         };
@@ -229,7 +229,7 @@ impl BotCommand for Lp {
             } else {
                 CommandResponse::Public(response)
             };
-            command.respond(ctx, response, None).await?;
+            command.respond(&ctx.http, response, None).await?;
         }
         Ok(CommandResponse::None)
     }

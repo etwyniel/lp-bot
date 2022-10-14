@@ -1,8 +1,14 @@
+use std::borrow::Cow;
+use std::fmt::Write;
+
 use anyhow::bail;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fallible_iterator::FallibleIterator;
 use rusqlite::{params, types::FromSql, Connection, Error::SqliteFailure, ErrorCode, ToSql};
-use serenity::model::{channel::Message, id::MessageId};
+use serenity::{
+    model::{channel::Message, id::MessageId},
+    prelude::Mutex,
+};
 
 use crate::Handler;
 
@@ -223,6 +229,69 @@ impl Handler {
     }
 }
 
+pub fn get_release_year(db: &Connection, artist: &str, album: &str) -> Option<u64> {
+    db.query_row(
+        "SELECT year FROM album_cache WHERE artist = ?1 AND album = ?2",
+        [artist, album],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+pub async fn set_release_year(
+    db: &Mutex<Connection>,
+    artist: &str,
+    album: &str,
+    year: u64,
+) -> anyhow::Result<()> {
+    let db = db.lock().await;
+    db.execute("INSERT INTO album_cache (artist, album, year) VALUES (?1, ?2, ?3) ON CONFLICT(artist, album) DO NOTHING",
+    params![artist, album, year])?;
+    Ok(())
+}
+
+pub fn escape_str(s: &str) -> Cow<'_, str> {
+    if !s.contains('\'') {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.replace('\'', "''"))
+}
+
+pub async fn get_release_years<'a, I: IntoIterator<Item = (&'a str, &'a str, usize)>>(
+    db: &Mutex<Connection>,
+    albums: I,
+) -> anyhow::Result<Vec<(usize, u64)>> {
+    let mut query = "WITH albums_in(artist, album, pos) AS(VALUES".to_string();
+    albums.into_iter().enumerate().for_each(|(i, ab)| {
+        if i > 0 {
+            query.push(',');
+        }
+        write!(
+            &mut query,
+            "('{}', '{}', {})",
+            escape_str(ab.0),
+            escape_str(ab.1),
+            ab.2
+        )
+        .unwrap();
+    });
+    query.push_str(
+        ")
+        SELECT albums_in.pos, album_cache.year
+        FROM album_cache JOIN albums_in
+        ON albums_in.artist = album_cache.artist
+        AND albums_in.album = album_cache.album",
+    );
+    let db = db.lock().await;
+    let mut stmt = db.prepare(&query)?;
+    let res = stmt
+        .query([])?
+        .map(|row| Ok((row.get(0)?, row.get(1)?)))
+        .collect()
+        .map_err(anyhow::Error::from);
+    res
+}
+
 pub fn init() -> anyhow::Result<Connection> {
     let conn = Connection::open("lpbot.sqlite")?;
     conn.execute(
@@ -269,5 +338,15 @@ pub fn init() -> anyhow::Result<Connection> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS album_cache (
+            artist STRING NOT NULL,
+            album STRING NOT NULL,
+            year INTEGER NOT NULL,
+            UNIQUE(artist, album)
+        )",
+        [],
+    )?;
+
     Ok(conn)
 }

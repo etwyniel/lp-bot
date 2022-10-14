@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use serenity::{
     async_trait,
-    client::Context,
+    http::Http,
     model::{
         application::interaction::application_command::{
             CommandDataOption, CommandDataOptionValue,
@@ -19,7 +19,7 @@ use serenity_command::CommandResponse;
 pub trait Responder {
     async fn respond(
         &self,
-        ctx: &Context,
+        http: &Http,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>>;
@@ -27,7 +27,6 @@ pub trait Responder {
 
 pub struct SlashCommand<'a, 'b> {
     pub handler: &'a Handler,
-    pub ctx: &'b Context,
     pub command: &'b ApplicationCommandInteraction,
 }
 
@@ -35,26 +34,27 @@ pub struct SlashCommand<'a, 'b> {
 impl Responder for ApplicationCommandInteraction {
     async fn respond(
         &self,
-        ctx: &Context,
+        http: &Http,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>> {
-        let (contents, flags) = match contents.to_contents_and_flags() {
+        let (contents, embeds, flags) = match contents.to_contents_and_flags() {
             None => return Ok(None),
             Some(c) => c,
         };
         self
-            .create_interaction_response(&ctx.http, |resp|
+            .create_interaction_response(http, |resp|
                 resp
                 .kind(serenity::model::application::interaction::InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message|
+                .interaction_response_data(|message| {
+                    embeds.into_iter().for_each(|em| {message.add_embed(em);});
                     message
                     .content(&contents)
                     .flags(flags)
                     .allowed_mentions(|mentions| mentions.roles(role_id))
-                )
+                })
             ).await?;
-        self.get_interaction_response(&ctx.http)
+        self.get_interaction_response(http)
             .await
             .map_err(anyhow::Error::from)
             .map(Some)
@@ -65,27 +65,28 @@ impl Responder for ApplicationCommandInteraction {
 impl Responder for SlashCommand<'_, '_> {
     async fn respond(
         &self,
-        _ctx: &Context,
+        http: &Http,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>> {
-        let (contents, flags) = match contents.to_contents_and_flags() {
+        let (contents, embeds, flags) = match contents.to_contents_and_flags() {
             None => return Ok(None),
             Some(c) => c,
         };
         self.command
-            .create_interaction_response(&self.ctx.http, |resp|
+            .create_interaction_response(http, |resp|
                 resp
                 .kind(serenity::model::application::interaction::InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message|
+                .interaction_response_data(|message| {
+                    embeds.into_iter().for_each(|em| {message.add_embed(em);});
                     message
                     .content(&contents)
                     .flags(flags)
                     .allowed_mentions(|mentions| mentions.roles(role_id))
-                )
+                })
             ).await?;
         self.command
-            .get_interaction_response(&self.ctx.http)
+            .get_interaction_response(http)
             .await
             .map_err(anyhow::Error::from)
             .map(Some)
@@ -138,7 +139,6 @@ impl<'a, 'b> SlashCommand<'a, 'b> {
 
 pub struct TextCommand<'a, 'b> {
     pub handler: &'a Handler,
-    pub ctx: &'b Context,
     pub message: &'b Message,
 }
 
@@ -146,20 +146,21 @@ pub struct TextCommand<'a, 'b> {
 impl Responder for TextCommand<'_, '_> {
     async fn respond(
         &self,
-        _ctx: &Context,
+        http: &Http,
         contents: CommandResponse,
         role_id: Option<u64>,
     ) -> anyhow::Result<Option<Message>> {
-        let (contents, _) = match contents.to_contents_and_flags() {
+        let (contents, embeds, _) = match contents.to_contents_and_flags() {
             None => return Ok(None),
             Some(c) => c,
         };
-        let channel = match self.message.channel(&self.ctx.http).await? {
+        let channel = match self.message.channel(http).await? {
             Channel::Guild(c) => c,
             _ => return Err(anyhow!("Invalid channel")),
         };
         channel
-            .send_message(&self.ctx.http, |msg| {
+            .send_message(http, |msg| {
+                msg.add_embeds(embeds.into_iter().collect());
                 msg.content(&contents)
                     .allowed_mentions(|mentions| mentions.roles(role_id))
             })

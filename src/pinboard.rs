@@ -110,8 +110,10 @@ impl Handler {
             .or_else(|| author.avatar_url())
             .filter(|av| av.starts_with("http"));
         let channel_name = channel
-            .name(&ctx)
-            .await
+            .to_channel(&ctx)
+            .await?
+            .guild()
+            .map(|ch| ch.name().to_string())
             .unwrap_or_else(|| "unknown-channel".to_string());
         // Filter attachments to find images
         let mut images = last_pin

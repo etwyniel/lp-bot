@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write;
-use std::time::Duration;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use album::Album;
 use anyhow::{anyhow, bail};
 use autoreact::ReactsCache;
-use chrono::{Datelike, Utc};
+use chrono::{Datelike, Local, Timelike, Utc};
+use commands::{ready_poll, GetQuote};
+use fallible_iterator::FallibleIterator;
 use lastfm::Lastfm;
 use rusqlite::Connection;
 use serenity::builder::CreateApplicationCommandOption;
+use serenity::http::Http;
 use serenity::model::application::command::CommandType;
 use serenity::model::application::interaction::autocomplete::AutocompleteInteraction;
 use serenity::model::channel::Channel;
@@ -18,18 +23,19 @@ use serenity::model::id::ChannelId;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOption, CommandDataOptionValue,
 };
-use serenity::model::prelude::Message;
+use serenity::model::prelude::{Message, UserId};
 use serenity::{
     async_trait,
     model::{
         application::command::{Command, CommandOptionType},
-        application::interaction::{Interaction, InteractionResponseType, MessageFlags},
+        application::interaction::Interaction,
         gateway::GatewayIntents,
         gateway::Ready,
         id::GuildId,
     },
     prelude::*,
 };
+
 mod album;
 mod autoreact;
 mod bandcamp;
@@ -44,18 +50,21 @@ mod spotify;
 
 use album::AlbumProvider;
 use bandcamp::Bandcamp;
-use command_context::{get_focused_option, get_str_opt_ac, SlashCommand};
+use command_context::{get_focused_option, get_str_opt_ac, Responder, SlashCommand, TextCommand};
 use db::Birthday;
 use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
 use spotify::Spotify;
-use tokio::sync;
+use tokio::sync::{self, OnceCell};
+use tokio::time::interval;
 
 pub struct Handler {
-    db: sync::Mutex<Connection>,
+    db: Arc<sync::Mutex<Connection>>,
+    spotify: Arc<Spotify>,
     providers: Vec<Box<dyn AlbumProvider>>,
-    lastfm: Lastfm,
+    lastfm: Arc<Lastfm>,
     reacts_cache: RwLock<ReactsCache>,
     commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
+    http: OnceCell<Arc<Http>>,
 }
 
 trait InteractionExt {
@@ -77,21 +86,29 @@ impl Handler {
     }
 
     async fn new() -> anyhow::Result<Self> {
-        let conn = db::init()?;
+        let conn = Arc::new(sync::Mutex::new(db::init()?));
+        let spotify = Arc::new(Spotify::new().await?);
         let providers = vec![
-            Box::new(Spotify::new().await?) as Box<dyn AlbumProvider>,
+            Box::new(Arc::clone(&spotify)) as Box<dyn AlbumProvider>,
             Box::new(Bandcamp::new()),
         ];
-        let lastfm = Lastfm::new();
-        let reacts_cache = RwLock::new(autoreact::new(&conn).await?);
+        let lastfm = Arc::new(Lastfm::new());
+        let reacts_cache = RwLock::new(autoreact::new(conn.lock().await.deref()).await?);
         let commands = RwLock::new(Self::init_commands());
-        Ok(Handler {
-            db: sync::Mutex::new(conn),
+        let handler = Handler {
+            db: conn,
+            spotify,
             providers,
             lastfm,
             reacts_cache,
             commands,
-        })
+            http: OnceCell::new(),
+        };
+        Ok(handler)
+    }
+
+    fn http(&self) -> &Http {
+        self.http.get().unwrap().as_ref()
     }
 
     pub fn get_provider(&self, provider: Option<&str>) -> &dyn AlbumProvider {
@@ -134,13 +151,18 @@ impl Handler {
         Ok(choices)
     }
 
-    async fn process_command(&self, cmd: SlashCommand<'_, '_>) -> anyhow::Result<CommandResponse> {
+    async fn process_command(
+        &self,
+        ctx: &Context,
+        cmd: SlashCommand<'_, '_>,
+    ) -> anyhow::Result<CommandResponse> {
         let guild_id = cmd
             .command
             .guild_id
             .ok_or_else(|| anyhow!("Must be run in a server"))?
             .0;
         let data = &cmd.command.data;
+        let http = self.http();
         match cmd.name() {
             "quote" => {
                 if let Some((_, message)) = cmd.command.data.resolved.messages.iter().next() {
@@ -153,7 +175,7 @@ impl Handler {
                     Ok(CommandResponse::Public(resp_text))
                 } else {
                     commands::GetQuote::from(data)
-                        .run(self, cmd.ctx, cmd.command)
+                        .run(self, ctx, cmd.command)
                         .await
                 }
             }
@@ -174,10 +196,10 @@ impl Handler {
                     .collect::<Vec<_>>()
                     .join("\n");
                 cmd.command
-                    .create_interaction_response(&cmd.ctx.http, |resp| {
+                    .create_interaction_response(http, |resp| {
                         resp.interaction_response_data(|data| {
                             let header = if let Some(server) =
-                                cmd.command.guild_id.and_then(|g| g.name(&cmd.ctx))
+                                cmd.command.guild_id.and_then(|g| g.name(ctx))
                             {
                                 format!("Birthdays in {}", server)
                             } else {
@@ -193,13 +215,13 @@ impl Handler {
                 let url = cmd.str_opt("url").unwrap();
                 let scale = cmd.number_opt("scale").unwrap_or(0.5);
                 cmd.command
-                    .create_interaction_response(&cmd.ctx.http, |resp| {
+                    .create_interaction_response(http, |resp| {
                         resp.interaction_response_data(|data| data.content("Processing image..."))
                     })
                     .await?;
                 let magiked = magik::magik(&url, scale)?;
                 cmd.command
-                    .create_followup_message(&cmd.ctx.http, |msg| {
+                    .create_followup_message(http, |msg| {
                         msg.add_file((magiked.as_slice(), "out.png"))
                     })
                     .await?;
@@ -207,7 +229,7 @@ impl Handler {
             }
             _ => {
                 if let Some(runner) = self.commands.read().await.get(cmd.name()) {
-                    runner.run(self, cmd.ctx, cmd.command).await
+                    runner.run(self, ctx, cmd.command).await
                 } else {
                     bail!("Unknown command")
                 }
@@ -275,19 +297,17 @@ impl Handler {
         .map_err(anyhow::Error::from)
     }
 
-    async fn crabdown(&self, ctx: &Context, channel: ChannelId) -> anyhow::Result<()> {
+    async fn crabdown(&self, http: &Http, channel: ChannelId) -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.tick().await;
         for i in 0..3 {
             channel
-                .send_message(&ctx.http, |msg| msg.content("🦀".repeat(3 - i)))
+                .send_message(http, |msg| msg.content("🦀".repeat(3 - i)))
                 .await?;
             interval.tick().await;
         }
         channel
-            .send_message(&ctx.http, |msg| {
-                msg.content("<a:CrabRave:988508208240922635>")
-            })
+            .send_message(http, |msg| msg.content("<a:CrabRave:988508208240922635>"))
             .await?;
         Ok(())
     }
@@ -308,8 +328,86 @@ impl Handler {
         }
         Ok(())
     }
+
+    async fn process_message(&self, ctx: Context, msg: Message) -> anyhow::Result<()> {
+        let lower = msg.content.to_lowercase();
+        if &lower == ".fmcrabdown" || &lower == ".crabdown" {
+            self.crabdown(&ctx.http, msg.channel_id).await?;
+            return Ok(());
+        } else if let Some(params) = msg.content.strip_prefix(".lpquote") {
+            let params = params.trim();
+            let mut user: Option<UserId> = params.parse().ok();
+            let mut number: Option<i64> = params.parse().ok();
+            if number.map(|n| n > 1000000).unwrap_or(false) {
+                user = number.take().map(|n| UserId(n as u64));
+            }
+            let resp = GetQuote { number, user }
+                .get_quote(
+                    self,
+                    &ctx,
+                    msg.guild_id
+                        .ok_or_else(|| anyhow!("Must be run in a server"))?
+                        .0,
+                )
+                .await?;
+            TextCommand {
+                handler: self,
+                message: &msg,
+            }
+            .respond(&ctx.http, resp, None)
+            .await?;
+        }
+        self.add_reacts(&ctx, msg).await
+    }
 }
 
+async fn wish_bday(http: &Http, user_id: u64, guild_id: GuildId) -> anyhow::Result<()> {
+    let member = guild_id.member(http, user_id).await?;
+    let channels = guild_id.channels(http).await?;
+    let channel = channels
+        .values()
+        .find(|chan| chan.name() == "general")
+        .or_else(|| {
+            channels
+                .values()
+                .find(|chan| chan.position == 0 || chan.position == -1)
+        })
+        .ok_or_else(|| anyhow!("Could not find a suitable channel"))?;
+    channel
+        .say(http, format!("Happy birthday to <@{}>!", member.user.id.0))
+        .await?;
+    Ok(())
+}
+
+async fn bday_loop(db: Arc<Mutex<Connection>>, http: Arc<Http>) {
+    let mut interval = interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        let now = Local::now();
+        if now.hour() != 10 {
+            continue;
+        }
+        let guilds_and_users = {
+            let db = db.lock().await;
+            let mut stmt = db
+                .prepare("SELECT guild_id, user_id FROM bdays WHERE day = ?1 AND month = ?2")
+                .unwrap();
+            stmt.query([now.day(), now.month()])
+                .unwrap()
+                .map(|row| Ok((row.get(0)?, row.get(1)?)))
+                .iterator()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        for (guild_id, user_id) in guilds_and_users {
+            if let Err(e) = wish_bday(http.as_ref(), user_id, GuildId(guild_id)).await {
+                eprintln!("Error wishing user birthday: {:?}", e);
+            }
+        }
+    }
+}
+
+// Format command options for debug output
 fn format_options(opts: &[CommandDataOption]) -> String {
     let mut out = String::new();
     for (i, opt) in opts.iter().enumerate() {
@@ -346,26 +444,18 @@ impl EventHandler for Handler {
 
             let cmd = SlashCommand {
                 handler: self,
-                ctx: &ctx,
                 command: &command,
             };
-            let resp = self.process_command(cmd).await;
-            eprintln!("{guild_name}{user}: /{name} -> {:?}", &resp);
-            let (contents, flags) = match resp {
-                Ok(CommandResponse::None) => return,
-                Ok(CommandResponse::Public(s)) => (s, MessageFlags::empty()),
-                Ok(CommandResponse::Private(s)) => (s, MessageFlags::EPHEMERAL),
-                Err(e) => (e.to_string(), MessageFlags::EPHEMERAL),
+            let start = Instant::now();
+            let resp = self.process_command(&ctx, cmd).await;
+            let elapsed = start.elapsed();
+            eprintln!("{guild_name}{user}: /{name} -({:?})-> {:?}", elapsed, &resp);
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => CommandResponse::Private(e.to_string()),
             };
 
-            if let Err(why) = command
-                .create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(contents).flags(flags))
-                })
-                .await
-            {
+            if let Err(why) = command.respond(&ctx.http, resp, None).await {
                 eprintln!("cannot respond to slash command: {:?}", why);
                 return;
             }
@@ -373,6 +463,9 @@ impl EventHandler for Handler {
     }
 
     async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
+        ready_poll::handle_ready_poll(self, &add_reaction)
+            .await
+            .unwrap();
         if !add_reaction.emoji.unicode_eq("🗨️") {
             return;
         }
@@ -407,6 +500,8 @@ impl EventHandler for Handler {
             ready.user.name,
             ready.guilds.len()
         );
+        self.http.set(Arc::clone(&ctx.http)).unwrap();
+        _ = tokio::spawn(bday_loop(Arc::clone(&self.db), Arc::clone(&ctx.http)));
 
         let guild_id = GuildId(
             env::var("GUILD_ID")
@@ -485,14 +580,8 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
-        if &new_message.content == ".fmcrabdown" {
-            if let Err(e) = self.crabdown(&ctx, new_message.channel_id).await {
-                eprintln!("Error sending countdown: {:?}", e);
-            }
-            return;
-        }
-        if let Err(e) = self.add_reacts(&ctx, new_message).await {
-            eprintln!("Error adding reacts: {:?}", e);
+        if let Err(e) = self.process_message(ctx, new_message).await {
+            eprintln!("Error processing message: {:?}", e);
         }
     }
 

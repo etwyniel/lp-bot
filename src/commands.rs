@@ -1,10 +1,9 @@
-use serenity::builder::CreateApplicationCommandOption;
+use serenity::builder::{CreateApplicationCommandOption, CreateEmbed};
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
-use serenity::model::user::User;
 use serenity::model::Permissions;
 use serenity::{
     async_trait,
-    model::prelude::{interaction::InteractionResponseType, GuildId, Role, UserId},
+    model::prelude::{GuildId, Role, UserId},
     prelude::Context,
 };
 use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
@@ -13,14 +12,18 @@ use serenity_command_derive::Command;
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::lastfm::GetAotys;
 use crate::reltime::Relative;
 use crate::Handler;
 
 use anyhow::{anyhow, bail};
 
 pub mod lp;
+pub mod ready_poll;
 
 use lp::Lp;
+
+use self::ready_poll::ReadyPoll;
 
 trait InteractionExt {
     fn guild_id(&self) -> anyhow::Result<GuildId>;
@@ -146,7 +149,7 @@ impl BotCommand for SetCreateThreads {
                 "not "
             }
         );
-        Ok(CommandResponse::Public(contents))
+        Ok(CommandResponse::Private(contents))
     }
 
     const PERMISSIONS: Permissions = Permissions::MANAGE_THREADS;
@@ -156,9 +159,9 @@ impl BotCommand for SetCreateThreads {
 #[cmd(name = "quote", desc = "Retrieve a quote")]
 pub struct GetQuote {
     #[cmd(desc = "Number the quote was saved as (optional)", autocomplete)]
-    number: Option<i64>,
+    pub number: Option<i64>,
     #[cmd(desc = "Get a random quote from a specific user")]
-    user: Option<User>,
+    pub user: Option<UserId>,
 }
 
 #[async_trait]
@@ -171,11 +174,28 @@ impl BotCommand for GetQuote {
         opts: &ApplicationCommandInteraction,
     ) -> anyhow::Result<CommandResponse> {
         let guild_id = opts.guild_id()?.0;
+        self.get_quote(handler, ctx, guild_id).await
+    }
+
+    fn setup_options(opt_name: &'static str, opt: &mut CreateApplicationCommandOption) {
+        if opt_name == "number" {
+            opt.min_int_value(1);
+        }
+    }
+}
+
+impl GetQuote {
+    pub async fn get_quote(
+        self,
+        handler: &Handler,
+        ctx: &Context,
+        guild_id: u64,
+    ) -> anyhow::Result<CommandResponse> {
         let quote = if let Some(quote_number) = self.number {
             handler.fetch_quote(guild_id, quote_number as u64).await?
         } else {
             handler
-                .get_random_quote(guild_id, self.user.map(|u| u.id.0))
+                .get_random_quote(guild_id, self.user.map(|u| u.0))
                 .await?
         }
         .ok_or_else(|| anyhow!("No such quote"))?;
@@ -192,29 +212,21 @@ impl BotCommand for GetQuote {
             .await?
             .avatar_url()
             .filter(|av| av.starts_with("http"));
-        opts.create_interaction_response(&ctx.http, |resp| {
-            resp.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|data| {
-                    data.embed(|embed| {
-                        embed
-                            .author(|a| {
-                                author_avatar.map(|av| a.icon_url(av));
-                                a.name(format!("#{}", quote.quote_number))
-                            })
-                            .description(&contents)
-                            .url(message_url)
-                            .timestamp(quote.ts.format("%+").to_string())
-                    })
-                })
-        })
-        .await?;
-        Ok(CommandResponse::None)
-    }
-
-    fn setup_options(opt_name: &'static str, opt: &mut CreateApplicationCommandOption) {
-        if opt_name == "number" {
-            opt.min_int_value(1);
-        }
+        let quote_header = match (self.user, self.number) {
+            (_, Some(_)) => "".to_string(),
+            (Some(_), _) => format!(" - Random quote from {}", &quote.author_name),
+            (None, None) => " - Random quote".to_string(),
+        };
+        let mut create = CreateEmbed::default();
+        create
+            .author(|a| {
+                author_avatar.map(|av| a.icon_url(av));
+                a.name(format!("#{}{}", quote.quote_number, quote_header))
+            })
+            .description(&contents)
+            .url(message_url)
+            .timestamp(quote.ts.format("%+").to_string());
+        Ok(CommandResponse::Embed(create))
     }
 }
 
@@ -428,4 +440,6 @@ pub fn register_commands(
     add(Relative::runner());
     add(AddAutoreact::runner());
     add(RemoveAutoreact::runner());
+    add(GetAotys::runner());
+    add(ReadyPoll::runner());
 }

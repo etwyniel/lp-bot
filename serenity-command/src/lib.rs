@@ -1,5 +1,5 @@
 use serenity::async_trait;
-use serenity::builder::{CreateApplicationCommand, CreateApplicationCommandOption};
+use serenity::builder::{CreateApplicationCommand, CreateApplicationCommandOption, CreateEmbed};
 use serenity::model::application::interaction::application_command::{
     ApplicationCommandInteraction, CommandData,
 };
@@ -12,6 +12,7 @@ pub enum CommandResponse {
     None,
     Public(String),
     Private(String),
+    Embed(CreateEmbed),
 }
 
 #[async_trait]
@@ -30,11 +31,12 @@ pub trait BotCommand {
 }
 
 impl CommandResponse {
-    pub fn to_contents_and_flags(self) -> Option<(String, MessageFlags)> {
+    pub fn to_contents_and_flags(self) -> Option<(String, Option<CreateEmbed>, MessageFlags)> {
         Some(match self {
             CommandResponse::None => return None,
-            CommandResponse::Public(s) => (s, MessageFlags::empty()),
-            CommandResponse::Private(s) => (s, MessageFlags::EPHEMERAL),
+            CommandResponse::Public(s) => (s, None, MessageFlags::empty()),
+            CommandResponse::Private(s) => (s, None, MessageFlags::EPHEMERAL),
+            CommandResponse::Embed(e) => (String::new(), Some(e), MessageFlags::empty()),
         })
     }
 }

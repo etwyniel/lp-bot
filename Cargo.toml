@@ -22,3 +22,7 @@ rand = "0.8"
 fallible-iterator = "0.2"
 serenity-command-derive = { version = "0.1.0", path = "serenity-command-derive" }
 serenity-command = { version = "0.1.0", path = "serenity-command" }
+futures = "0.3.24"
+tokio-stream = "0.1.10"
+rspotify-http = "0.11.5"
+image = "0.24.3"

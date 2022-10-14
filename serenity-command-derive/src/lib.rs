@@ -120,8 +120,12 @@ fn analyze_field(
                         quote!(#opt_value::Role(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Role),
                     ),
-                    "User" | "serenity::model::User" => (
+                    "User" | "serenity::model::user::User" => (
                         quote!(#opt_value::User(v, _)),
+                        quote!(serenity::model::application::command::CommandOptionType::User),
+                    ),
+                    "UserId" | "serenity::model::user::UserId" => (
+                        quote!(#opt_value::User(serenity::model::user::User{id: v, ..}, _)),
                         quote!(serenity::model::application::command::CommandOptionType::User),
                     ),
                     other => {
@@ -234,6 +238,7 @@ fn derive(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
 
+            #[allow(non_camel_case_types)]
             struct #runner_ident;
 
             #[async_trait]

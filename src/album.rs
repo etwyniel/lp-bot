@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serenity::async_trait;
 
 #[derive(Debug, Default)]
@@ -45,5 +47,28 @@ impl Album {
             (Some(n), None) => n.to_string(),
             _ => "this".to_string(),
         }
+    }
+}
+
+#[async_trait]
+impl<P: AlbumProvider + Send> AlbumProvider for Arc<P> {
+    fn url_matches(&self, url: &str) -> bool {
+        self.as_ref().url_matches(url)
+    }
+
+    fn id(&self) -> &'static str {
+        self.as_ref().id()
+    }
+
+    async fn get_from_url(&self, url: &str) -> anyhow::Result<Album> {
+        self.as_ref().get_from_url(url).await
+    }
+
+    async fn query_album(&self, q: &str) -> anyhow::Result<Album> {
+        self.as_ref().query_album(q).await
+    }
+
+    async fn query_albums(&self, q: &str) -> anyhow::Result<Vec<(String, String)>> {
+        self.as_ref().query_albums(q).await
     }
 }

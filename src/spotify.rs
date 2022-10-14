@@ -53,6 +53,13 @@ impl Spotify {
     }
 }
 
+fn sanitize_string(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !r#""'+()[]"#.contains(c))
+        .take(30)
+        .collect()
+}
+
 #[async_trait]
 impl AlbumProvider for Spotify {
     fn id(&self) -> &'static str {
@@ -87,6 +94,7 @@ impl AlbumProvider for Spotify {
                     name: Some(a.name.clone()),
                     artist: a.artists.first().map(|ar| ar.name.clone()),
                     url: a.id.as_ref().map(|i| i.url()),
+                    release_date: a.release_date.clone(),
                     ..Default::default()
                 })
                 .ok_or_else(|| anyhow!("Not found"))?)
@@ -137,5 +145,33 @@ impl Spotify {
         // Obtaining the access token
         spotify.request_token().await?;
         Ok(Spotify { client: spotify })
+    }
+
+    pub async fn get_album(&self, artist: &str, name: &str) -> anyhow::Result<Option<Album>> {
+        let query = format!(
+            r#"album:"{}" artist:"{}""#,
+            &sanitize_string(name),
+            &sanitize_string(artist)
+        );
+        let res = self
+            .client
+            .search(&query, &SearchType::Album, None, None, Some(5), None)
+            .await?;
+        if let rspotify::model::SearchResult::Albums(albums) = res {
+            let album = albums
+                .items
+                .iter()
+                .find(|ab| &ab.name == name)
+                .or(albums.items.first());
+            Ok(album.map(|a| Album {
+                name: Some(a.name.clone()),
+                artist: a.artists.first().map(|ar| ar.name.clone()),
+                url: a.id.as_ref().map(|i| i.url()),
+                release_date: a.release_date.clone(),
+                ..Default::default()
+            }))
+        } else {
+            Err(anyhow!("Not an album"))
+        }
     }
 }
