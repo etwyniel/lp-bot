@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fmt::Write;
 use std::ops::Deref;
@@ -19,7 +19,7 @@ use serenity::model::application::command::CommandType;
 use serenity::model::application::interaction::autocomplete::AutocompleteInteraction;
 use serenity::model::channel::Channel;
 use serenity::model::event::ChannelPinsUpdateEvent;
-use serenity::model::id::ChannelId;
+use serenity::model::id::{ChannelId, InteractionId};
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOption, CommandDataOptionValue,
 };
@@ -64,6 +64,7 @@ pub struct Handler {
     lastfm: Arc<Lastfm>,
     reacts_cache: RwLock<ReactsCache>,
     commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
+    ready_polls: Arc<Mutex<VecDeque<(InteractionId, Option<String>, Option<String>)>>>,
     http: OnceCell<Arc<Http>>,
 }
 
@@ -95,6 +96,7 @@ impl Handler {
         let lastfm = Arc::new(Lastfm::new());
         let reacts_cache = RwLock::new(autoreact::new(conn.lock().await.deref()).await?);
         let commands = RwLock::new(Self::init_commands());
+        let ready_polls = Default::default();
         let handler = Handler {
             db: conn,
             spotify,
@@ -102,6 +104,7 @@ impl Handler {
             lastfm,
             reacts_cache,
             commands,
+            ready_polls,
             http: OnceCell::new(),
         };
         Ok(handler)
@@ -297,17 +300,21 @@ impl Handler {
         .map_err(anyhow::Error::from)
     }
 
-    async fn crabdown(&self, http: &Http, channel: ChannelId) -> anyhow::Result<()> {
+    async fn crabdown(&self, http: &Http, channel: ChannelId, count_emote: Option<&str>, go_emote: Option<&str>) -> anyhow::Result<()> {
+        channel.say(http, "Starting 3s countdown").await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.tick().await;
+        let count_emote = count_emote.unwrap_or("🦀");
+        let go_emote = go_emote.unwrap_or("<a:CrabRave:988508208240922635>");
         for i in 0..3 {
             channel
-                .send_message(http, |msg| msg.content("🦀".repeat(3 - i)))
+                .send_message(http, |msg| msg.content(count_emote.repeat(3 - i)))
                 .await?;
             interval.tick().await;
         }
         channel
-            .send_message(http, |msg| msg.content("<a:CrabRave:988508208240922635>"))
+            .send_message(http, |msg| msg.content(go_emote))
             .await?;
         Ok(())
     }
@@ -332,7 +339,7 @@ impl Handler {
     async fn process_message(&self, ctx: Context, msg: Message) -> anyhow::Result<()> {
         let lower = msg.content.to_lowercase();
         if &lower == ".fmcrabdown" || &lower == ".crabdown" {
-            self.crabdown(&ctx.http, msg.channel_id).await?;
+            self.crabdown(&ctx.http, msg.channel_id, None, None).await?;
             return Ok(());
         } else if let Some(params) = msg.content.strip_prefix(".lpquote") {
             let params = params.trim();

@@ -12,9 +12,16 @@ const YES: &str = "<:FeelsGoodCrab:988509541069127780>";
 const NO: &str = "<:FeelsBadCrab:988508541499342918>";
 const GO: &str = "<a:CrabRave:988508208240922635>";
 
+const MAX_POLLS: usize = 20;
+
 #[derive(Command, Debug)]
 #[cmd(name = "ready_poll", desc = "Poll to start a listening party")]
-pub struct ReadyPoll {}
+pub struct ReadyPoll {
+    #[cmd(desc = "Count emote")]
+    pub count_emote: Option<String>,
+    #[cmd(desc = "Emote Go")]
+    pub go_emote: Option<String>,
+}
 
 #[async_trait]
 impl BotCommand for ReadyPoll {
@@ -22,7 +29,7 @@ impl BotCommand for ReadyPoll {
 
     async fn run(
         self,
-        _data: &Handler,
+        handler: &Handler,
         ctx: &Context,
         interaction: &ApplicationCommandInteraction,
     ) -> anyhow::Result<CommandResponse> {
@@ -36,6 +43,11 @@ impl BotCommand for ReadyPoll {
         resp.react(http, ReactionType::from_str(YES)?).await?;
         resp.react(http, ReactionType::from_str(NO)?).await?;
         resp.react(http, ReactionType::from_str(GO)?).await?;
+        let mut polls = handler.ready_polls.lock().await;
+        while polls.len() >= MAX_POLLS {
+            polls.pop_back();
+        }
+        polls.push_front((interaction.id, self.count_emote, self.go_emote));
         Ok(CommandResponse::None)
     }
 }
@@ -46,13 +58,25 @@ pub async fn handle_ready_poll(handler: &Handler, react: &Reaction) -> anyhow::R
     }
     let http = handler.http();
     let msg = react.message(http).await?;
-    match msg.interaction.as_ref() {
+    let interaction_id = match msg.interaction.as_ref() {
         None => return Ok(()),
         Some(interaction) => {
             if Some(interaction.user.id) != react.user_id {
                 return Ok(());
             }
+            interaction.id
         }
-    }
-    handler.crabdown(http, msg.channel_id).await
+    };
+    let (count, go) = {
+        let mut polls = handler.ready_polls.lock().await;
+        if let Some((ndx, (_, count, go))) = polls.iter().enumerate().find(|(_, (id, _, _))| *id == interaction_id) {
+            let count = count.clone();
+            let go = go.clone();
+            polls.remove(ndx);
+            (count, go)
+        } else {
+            (None, None)
+        }
+    };
+    handler.crabdown(http, msg.channel_id, count.as_deref(), go.as_deref()).await
 }
