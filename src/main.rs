@@ -262,6 +262,7 @@ impl Handler {
                     ac.create_autocomplete_response(&ctx.http, |r| {
                         quotes
                             .into_iter()
+                            .filter(|(_, quote)| !quote.is_empty())
                             .map(|(num, quote)| (num, quote.chars().take(100).collect::<String>()))
                             .for_each(|(num, q)| {
                                 r.add_int_choice(q, num as i64);
