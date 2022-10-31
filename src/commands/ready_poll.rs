@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
 
+use serenity::model::id::InteractionId;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::prelude::{Reaction, ReactionType};
 use serenity::{async_trait, prelude::Context};
@@ -13,6 +15,8 @@ const NO: &str = "<:FeelsBadCrab:988508541499342918>";
 const GO: &str = "<a:CrabRave:988508208240922635>";
 
 const MAX_POLLS: usize = 20;
+
+pub type PendingPolls = VecDeque<(InteractionId, Option<String>, Option<String>)>;
 
 #[derive(Command, Debug)]
 #[cmd(name = "ready_poll", desc = "Poll to start a listening party")]
@@ -69,7 +73,11 @@ pub async fn handle_ready_poll(handler: &Handler, react: &Reaction) -> anyhow::R
     };
     let (count, go) = {
         let mut polls = handler.ready_polls.lock().await;
-        if let Some((ndx, (_, count, go))) = polls.iter().enumerate().find(|(_, (id, _, _))| *id == interaction_id) {
+        if let Some((ndx, (_, count, go))) = polls
+            .iter()
+            .enumerate()
+            .find(|(_, (id, _, _))| *id == interaction_id)
+        {
             let count = count.clone();
             let go = go.clone();
             polls.remove(ndx);
@@ -78,5 +86,7 @@ pub async fn handle_ready_poll(handler: &Handler, react: &Reaction) -> anyhow::R
             (None, None)
         }
     };
-    handler.crabdown(http, msg.channel_id, count.as_deref(), go.as_deref()).await
+    handler
+        .crabdown(http, msg.channel_id, count.as_deref(), go.as_deref())
+        .await
 }

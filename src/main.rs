@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write;
 use std::ops::Deref;
@@ -9,6 +9,7 @@ use album::Album;
 use anyhow::{anyhow, bail};
 use autoreact::ReactsCache;
 use chrono::{Datelike, Local, Timelike, Utc};
+use commands::ready_poll::PendingPolls;
 use commands::{ready_poll, GetQuote};
 use fallible_iterator::FallibleIterator;
 use lastfm::Lastfm;
@@ -19,7 +20,7 @@ use serenity::model::application::command::CommandType;
 use serenity::model::application::interaction::autocomplete::AutocompleteInteraction;
 use serenity::model::channel::Channel;
 use serenity::model::event::ChannelPinsUpdateEvent;
-use serenity::model::id::{ChannelId, InteractionId};
+use serenity::model::id::ChannelId;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOption, CommandDataOptionValue,
 };
@@ -64,7 +65,7 @@ pub struct Handler {
     lastfm: Arc<Lastfm>,
     reacts_cache: RwLock<ReactsCache>,
     commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
-    ready_polls: Arc<Mutex<VecDeque<(InteractionId, Option<String>, Option<String>)>>>,
+    ready_polls: Arc<Mutex<PendingPolls>>,
     http: OnceCell<Arc<Http>>,
 }
 
@@ -301,7 +302,13 @@ impl Handler {
         .map_err(anyhow::Error::from)
     }
 
-    async fn crabdown(&self, http: &Http, channel: ChannelId, count_emote: Option<&str>, go_emote: Option<&str>) -> anyhow::Result<()> {
+    async fn crabdown(
+        &self,
+        http: &Http,
+        channel: ChannelId,
+        count_emote: Option<&str>,
+        go_emote: Option<&str>,
+    ) -> anyhow::Result<()> {
         channel.say(http, "Starting 3s countdown").await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut interval = tokio::time::interval(Duration::from_secs(1));

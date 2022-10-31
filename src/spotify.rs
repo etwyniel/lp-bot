@@ -161,8 +161,8 @@ impl Spotify {
             let album = albums
                 .items
                 .iter()
-                .find(|ab| &ab.name == name)
-                .or(albums.items.first());
+                .find(|ab| ab.name == name)
+                .or_else(|| albums.items.first());
             Ok(album.map(|a| Album {
                 name: Some(a.name.clone()),
                 artist: a.artists.first().map(|ar| ar.name.clone()),

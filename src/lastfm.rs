@@ -1,6 +1,5 @@
 use anyhow::Context as _;
 use chrono::{DateTime, Datelike, Utc};
-use futures;
 use futures::{StreamExt, TryStreamExt};
 use image::imageops::FilterType;
 use image::io::Reader;
@@ -339,7 +338,7 @@ async fn retrieve_release_year(url: &str) -> anyhow::Result<Option<u64>> {
         cap.get(1)
             .unwrap()
             .as_str()
-            .rsplit(" ")
+            .rsplit(' ')
             .next()
             .unwrap()
             .parse()
@@ -410,15 +409,21 @@ impl Lastfm {
         let mut params: Vec<(&'static str, &str)> = vec![("user", user)];
 
         let from_s = from.map(|from| from.timestamp().to_string());
-        from_s.as_deref().map(|from| params.push(("from", from)));
+        if let Some(from) = from_s.as_deref() {
+            params.push(("from", from));
+        }
         let to_s = to.map(|to| to.timestamp().to_string());
-        to_s.as_deref().map(|to| params.push(("to", to)));
+        if let Some(to) = to_s.as_deref() {
+            params.push(("to", to));
+        }
         let limit_s = limit.map(|limit| limit.to_string());
-        limit_s
-            .as_deref()
-            .map(|limit| params.push(("limit", limit)));
+        if let Some(limit) = limit_s.as_deref() {
+            params.push(("limit", limit));
+        }
         let page_s = page.map(|page| page.to_string());
-        page_s.as_deref().map(|page| params.push(("page", page)));
+        if let Some(page) = page_s.as_deref() {
+            params.push(("page", page));
+        }
 
         let recent_tracks: RecentTracksResp = self.query("user.getrecenttracks", params).await?;
         Ok(recent_tracks.recenttracks)
@@ -428,7 +433,9 @@ impl Lastfm {
         let mut params: Vec<(&'static str, &str)> = vec![("user", user), ("limit", "200")];
 
         let page_s = page.map(|p| p.to_string());
-        page_s.as_deref().map(|page| params.push(("page", page)));
+        if let Some(page) = page_s.as_deref() {
+            params.push(("page", page));
+        }
 
         let top_albums: TopAlbumsResp = self.query("user.gettopalbums", params).await?;
         Ok(top_albums.topalbums)
@@ -499,7 +506,7 @@ impl Lastfm {
                             let name = ab.name.clone();
                             let artist = ab.artist.name.clone();
                             let album = ab.name.clone();
-                            let url = ab.url.clone();
+                            let url = ab.url;
                             async move {
                                 // Backoff loop
                                 if let Some(year) = yr {
@@ -514,7 +521,7 @@ impl Lastfm {
                                     }
                                     Err(e) => eprintln!(
                                         "Error getting release year from lastfm: {}",
-                                        e.to_string()
+                                        e
                                     ),
                                     _ => (),
                                 }
@@ -526,7 +533,7 @@ impl Lastfm {
                                             ..
                                         })) => {
                                             let year =
-                                                date.split("-").next().unwrap().parse().unwrap();
+                                                date.split('-').next().unwrap().parse().unwrap();
                                             crate::db::set_release_year(&db, &artist, &name, year)
                                                 .await?;
                                             break Ok((i, Some(year)));
