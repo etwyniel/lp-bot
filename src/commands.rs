@@ -226,6 +226,9 @@ impl GetQuote {
             .description(&contents)
             .url(message_url)
             .timestamp(quote.ts.format("%+").to_string());
+        if let Some(image) = quote.image {
+            create.image(image);
+        }
         Ok(CommandResponse::Embed(create))
     }
 }

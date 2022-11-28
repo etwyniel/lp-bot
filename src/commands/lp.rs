@@ -208,7 +208,7 @@ impl BotCommand for Lp {
             if let (None, Some((ChannelType::PublicThread, c))) = (&webhook, &guild_chan) {
                 // If we're already in a thread, just rename it
                 // unless we are using a webhook, in which case we can create a new thread
-                c.edit_thread(http, |t| t.name(&thread_name)).await?;
+                c.edit_thread(http, |t| t.name(thread_name)).await?;
             } else if let Some((ChannelType::Text, c)) = &guild_chan {
                 // Create thread from response message
                 let thread = c

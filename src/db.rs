@@ -4,9 +4,10 @@ use std::fmt::Write;
 use anyhow::bail;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fallible_iterator::FallibleIterator;
+use itertools::Itertools;
 use rusqlite::{params, types::FromSql, Connection, Error::SqliteFailure, ErrorCode, ToSql};
 use serenity::{
-    model::{channel::Message, id::MessageId},
+    model::{channel::Message, id::MessageId, prelude::ReactionType},
     prelude::Mutex,
 };
 
@@ -21,6 +22,7 @@ pub struct Quote {
     pub author_id: u64,
     pub author_name: String,
     pub contents: String,
+    pub image: Option<String>,
 }
 
 pub struct Birthday {
@@ -83,7 +85,50 @@ impl Handler {
         self.get_guild_field("pinboard_webhook", guild_id).await
     }
 
+    pub async fn message_to_quote_contents(&self, message: &Message) -> anyhow::Result<String> {
+        let prev_react = message
+            .reactions
+            .iter()
+            .tuple_windows()
+            .find(|(_, r)| r.reaction_type == ReactionType::Unicode("🗨️".to_string()))
+            .map(|(l, _)| &l.reaction_type);
+        let mut messages: Vec<(String, u64)> = Default::default();
+        if let Some(ReactionType::Unicode(emoji)) = prev_react {
+            let first_byte = emoji.as_bytes()[0];
+            if (b'1'..=b'9').contains(&first_byte) {
+                let num = first_byte as u64 - (b'0' as u64) - 1;
+                let http = self.http();
+                let before = message
+                    .channel(http)
+                    .await?
+                    .guild()
+                    .unwrap()
+                    .messages(http, |get| get.before(message.id).limit(num))
+                    .await?;
+                messages.extend(
+                    before
+                        .iter()
+                        .rev()
+                        .map(|msg| (msg.content.clone(), msg.author.id.0)),
+                );
+            }
+        }
+        messages.push((message.content.clone(), message.author.id.0));
+        let mut contents = String::new();
+        let mut prev_author = messages.first().unwrap().1;
+        for (msg, author) in messages {
+            if prev_author != author {
+                _ = writeln!(&mut contents, "- <@{prev_author}>");
+            }
+            contents.push_str(&msg);
+            contents.push('\n');
+            prev_author = author;
+        }
+        Ok(contents)
+    }
+
     pub async fn add_quote(&self, guild_id: u64, message: &Message) -> anyhow::Result<Option<u64>> {
+        let contents = self.message_to_quote_contents(message).await?;
         let mut db = self.db.lock().await;
         let tx = db.transaction()?;
         let last_quote: u64 = tx
@@ -97,11 +142,16 @@ impl Handler {
         let ts = message.timestamp;
         let author_id = message.author.id.0;
         let author_name = &message.author.name;
+        let image = message
+            .attachments
+            .iter()
+            .find(|att| att.height.is_some())
+            .map(|att| att.url.clone());
         match tx.execute(
             r"INSERT INTO quote (
     guild_id, channel_id, message_id, ts, quote_number,
-    author_id, author_name, contents
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    author_id, author_name, contents, image
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 guild_id,
                 channel_id,
@@ -110,7 +160,8 @@ impl Handler {
                 last_quote + 1,
                 author_id,
                 author_name,
-                &message.content
+                contents.trim(),
+                image
             ],
         ) {
             Err(SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
@@ -130,7 +181,7 @@ impl Handler {
     ) -> anyhow::Result<Option<Quote>> {
         let db = self.db.lock().await;
         let res = db.query_row(
-            "SELECT guild_id, channel_id, message_id, ts, author_id, author_name, contents FROM quote
+            "SELECT guild_id, channel_id, message_id, ts, author_id, author_name, contents, image FROM quote
      WHERE guild_id = ?1 AND quote_number = ?2",
             [guild_id, quote_number],
             |row| {
@@ -144,6 +195,7 @@ impl Handler {
                     author_id: row.get(4)?,
                     author_name: row.get(5)?,
                     contents: row.get(6)?,
+                    image: row.get(7)?,
                 })
             },
         );
@@ -314,6 +366,7 @@ pub fn init() -> anyhow::Result<Connection> {
             author_id INTEGER,
             author_name STRING,
             contents STRING,
+            image STRING,
             UNIQUE(guild_id, quote_number),
             UNIQUE(guild_id, message_id)
         )",

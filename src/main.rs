@@ -346,7 +346,7 @@ impl Handler {
 
     async fn process_message(&self, ctx: Context, msg: Message) -> anyhow::Result<()> {
         let lower = msg.content.to_lowercase();
-        if &lower == ".fmcrabdown" || &lower == ".crabdown" {
+        if lower.starts_with(".fmcrabdown") || lower.starts_with(".crabdown") {
             self.crabdown(&ctx.http, msg.channel_id, None, None).await?;
             return Ok(());
         } else if let Some(params) = msg.content.strip_prefix(".lpquote") {
@@ -354,6 +354,7 @@ impl Handler {
             let mut user: Option<UserId> = params.parse().ok();
             let mut number: Option<i64> = params.parse().ok();
             if number.map(|n| n > 1000000).unwrap_or(false) {
+                // Treating n as a user ID
                 user = number.take().map(|n| UserId(n as u64));
             }
             let resp = GetQuote { number, user }
