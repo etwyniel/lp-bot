@@ -1,5 +1,7 @@
+use regex::Regex;
 use serenity::builder::{CreateApplicationCommandOption, CreateEmbed};
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::prelude::ChannelId;
 use serenity::model::Permissions;
 use serenity::{
     async_trait,
@@ -162,6 +164,8 @@ pub struct GetQuote {
     pub number: Option<i64>,
     #[cmd(desc = "Get a random quote from a specific user")]
     pub user: Option<UserId>,
+    #[cmd(desc = "Hide the username for even more confusion")]
+    pub hide_author: Option<bool>,
 }
 
 #[async_trait]
@@ -203,20 +207,38 @@ impl GetQuote {
             "https://discord.com/channels/{}/{}/{}",
             quote.guild_id, quote.channel_id, quote.message_id
         );
-        let contents = format!(
+        let channel = ChannelId(quote.channel_id)
+            .to_channel(&ctx.http)
+            .await?
+            .guild();
+        let channel_name = channel
+            .as_ref()
+            .map(|c| c.name())
+            .unwrap_or("unknown-channel");
+        let hide_author = self.hide_author == Some(true);
+        let mut contents = format!(
             "{}\n - <@{}> [(Source)]({})",
             &quote.contents, quote.author_id, message_url
         );
-        let author_avatar = UserId(quote.author_id)
-            .to_user(&ctx.http)
-            .await?
-            .avatar_url()
-            .filter(|av| av.starts_with("http"));
-        let quote_header = match (self.user, self.number) {
-            (_, Some(_)) => "".to_string(),
-            (Some(_), _) => format!(" - Random quote from {}", &quote.author_name),
-            (None, None) => " - Random quote".to_string(),
+        let author_avatar = if hide_author {
+            None
+        } else {
+            UserId(quote.author_id)
+                .to_user(&ctx.http)
+                .await?
+                .avatar_url()
+                .filter(|av| av.starts_with("http"))
         };
+        let quote_header = match (self.user, self.number, hide_author) {
+            (_, Some(_), _) => "".to_string(), // Set quote number, not random
+            (Some(_), _, false) => format!(" - Random quote from {}", &quote.author_name),
+            (Some(_), _, true) => " - Random quote from REDACTED".to_string(),
+            (None, None, _) => " - Random quote".to_string(),
+        };
+        if hide_author {
+            let hide_author_re = Regex::new("(<@\\d+>)").unwrap();
+            contents = hide_author_re.replace_all(&contents, "||$1||").to_string();
+        }
         let mut create = CreateEmbed::default();
         create
             .author(|a| {
@@ -225,11 +247,48 @@ impl GetQuote {
             })
             .description(&contents)
             .url(message_url)
+            .footer(|f| f.text(format!("in #{}", channel_name)))
             .timestamp(quote.ts.format("%+").to_string());
         if let Some(image) = quote.image {
             create.image(image);
         }
         Ok(CommandResponse::Embed(create))
+    }
+}
+
+#[derive(Command)]
+#[cmd(name = "fake_quote", desc = "Get a procedurally generated quote")]
+pub struct FakeQuote {
+    user: Option<UserId>,
+    start: Option<String>,
+}
+
+#[async_trait]
+impl BotCommand for FakeQuote {
+    type Data = Handler;
+    async fn run(
+        self,
+        handler: &Handler,
+        _ctx: &Context,
+        opts: &ApplicationCommandInteraction,
+    ) -> anyhow::Result<CommandResponse> {
+        let chain = handler
+            .quotes_markov_chain(
+                opts.guild_id
+                    .ok_or_else(|| anyhow!("must be run in a guild"))?
+                    .0,
+                self.user.map(|u| u.0),
+            )
+            .await?;
+        let mut resp = if let Some(start) = self.start {
+            chain.generate_str_from_token(&start)
+        } else {
+            chain.generate_str()
+        };
+        if resp.is_empty() {
+            resp = "Failed to generate quote".to_string();
+        }
+        Ok(CommandResponse::Public(resp))
     }
 }
 
@@ -393,6 +452,8 @@ impl BotCommand for AddAutoreact {
             .await?;
         Ok(CommandResponse::Private("Autoreact added".to_string()))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_EMOJIS_AND_STICKERS;
 }
 
 #[derive(Command)]
@@ -425,6 +486,8 @@ impl BotCommand for RemoveAutoreact {
             .await?;
         Ok(CommandResponse::Private("Autoreact removed".to_string()))
     }
+
+    const PERMISSIONS: Permissions = Permissions::MANAGE_EMOJIS_AND_STICKERS;
 }
 
 pub fn register_commands(
@@ -445,4 +508,5 @@ pub fn register_commands(
     add(RemoveAutoreact::runner());
     add(GetAotys::runner());
     add(ReadyPoll::runner());
+    add(FakeQuote::runner());
 }

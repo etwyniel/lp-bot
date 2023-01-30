@@ -67,6 +67,7 @@ pub struct Handler {
     commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
     ready_polls: Arc<Mutex<PendingPolls>>,
     http: OnceCell<Arc<Http>>,
+    last_pin_updates: Arc<Mutex<HashMap<u64, i64>>>,
 }
 
 trait InteractionExt {
@@ -98,6 +99,7 @@ impl Handler {
         let reacts_cache = RwLock::new(autoreact::new(conn.lock().await.deref()).await?);
         let commands = RwLock::new(Self::init_commands());
         let ready_polls = Default::default();
+        let last_pin_updates = Default::default();
         let handler = Handler {
             db: conn,
             spotify,
@@ -107,6 +109,7 @@ impl Handler {
             commands,
             ready_polls,
             http: OnceCell::new(),
+            last_pin_updates,
         };
         Ok(handler)
     }
@@ -149,7 +152,7 @@ impl Handler {
         let mut choices = p.query_albums(query).await?;
         choices.iter_mut().for_each(|(name, _)| {
             if name.len() >= 100 {
-                *name = name[..100].to_string();
+                *name = name.chars().take(100).collect();
             }
         });
         Ok(choices)
@@ -349,7 +352,12 @@ impl Handler {
         if lower.starts_with(".fmcrabdown") || lower.starts_with(".crabdown") {
             self.crabdown(&ctx.http, msg.channel_id, None, None).await?;
             return Ok(());
-        } else if let Some(params) = msg.content.strip_prefix(".lpquote") {
+        } else if let Some(mut params) = msg.content.strip_prefix(".lpquote") {
+            let mut hide_author = None;
+            if let Some(suffix) = params.strip_prefix("_trivia") {
+                params = suffix;
+                hide_author = Some(true);
+            }
             let params = params.trim();
             let mut user: Option<UserId> = params.parse().ok();
             let mut number: Option<i64> = params.parse().ok();
@@ -357,15 +365,19 @@ impl Handler {
                 // Treating n as a user ID
                 user = number.take().map(|n| UserId(n as u64));
             }
-            let resp = GetQuote { number, user }
-                .get_quote(
-                    self,
-                    &ctx,
-                    msg.guild_id
-                        .ok_or_else(|| anyhow!("Must be run in a server"))?
-                        .0,
-                )
-                .await?;
+            let resp = GetQuote {
+                number,
+                user,
+                hide_author,
+            }
+            .get_quote(
+                self,
+                &ctx,
+                msg.guild_id
+                    .ok_or_else(|| anyhow!("Must be run in a server"))?
+                    .0,
+            )
+            .await?;
             TextCommand {
                 handler: self,
                 message: &msg,
@@ -602,6 +614,17 @@ impl EventHandler for Handler {
     }
 
     async fn channel_pins_update(&self, ctx: Context, pin: ChannelPinsUpdateEvent) {
+        let mut last_pin_updates = self.last_pin_updates.lock().await;
+        let Some(last_update) = pin.last_pin_timestamp else {
+            return;
+        };
+        let previous_update = last_pin_updates.get(&pin.channel_id.0).copied();
+        if Some(last_update.unix_timestamp()) == previous_update {
+            // pin deleted
+            return;
+        }
+        last_pin_updates.insert(pin.channel_id.0, last_update.unix_timestamp());
+        drop(last_pin_updates);
         let guild_id = match pin.guild_id {
             Some(gid) => gid,
             None => return,

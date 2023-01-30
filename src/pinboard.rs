@@ -75,6 +75,10 @@ impl Handler {
         channel: ChannelId,
         guild_id: GuildId,
     ) -> anyhow::Result<()> {
+        let pinboard_webhook = self
+            .get_pinboard_webhook(guild_id.0)
+            .await
+            .ok_or_else(|| anyhow!("No webhook configured"))?;
         let pins = channel
             .pins(&ctx.http)
             .await
@@ -85,10 +89,6 @@ impl Handler {
         };
         let message: SimpleMessage = last_pin.into();
         dbg!(message);
-        let pinboard_webhook = self
-            .get_pinboard_webhook(guild_id.0)
-            .await
-            .ok_or_else(|| anyhow!("No webhook configured"))?;
         let author = &last_pin.author;
         // retrieve user as guild member in order to get nickname and guild avatar
         let member = match guild_id.member(&ctx.http, author).await {

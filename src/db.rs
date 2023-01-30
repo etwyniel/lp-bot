@@ -1,11 +1,17 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fallible_iterator::FallibleIterator;
 use itertools::Itertools;
-use rusqlite::{params, types::FromSql, Connection, Error::SqliteFailure, ErrorCode, ToSql};
+use rusqlite::{
+    params,
+    types::{FromSql, ValueRef},
+    Connection,
+    Error::SqliteFailure,
+    ErrorCode, ToSql,
+};
 use serenity::{
     model::{channel::Message, id::MessageId, prelude::ReactionType},
     prelude::Mutex,
@@ -30,6 +36,17 @@ pub struct Birthday {
     pub day: u8,
     pub month: u8,
     pub year: Option<u16>,
+}
+
+fn column_as_string(val: ValueRef<'_>) -> rusqlite::Result<String> {
+    Ok(match val {
+        ValueRef::Null => String::new(),
+        ValueRef::Real(r) => r.to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Text(b) | ValueRef::Blob(b) => std::str::from_utf8(b)
+            .map_err(rusqlite::Error::Utf8Error)?
+            .to_string(),
+    })
 }
 
 impl Handler {
@@ -113,6 +130,14 @@ impl Handler {
                 );
             }
         }
+        if messages.is_empty() {
+            messages.extend(
+                message
+                    .referenced_message
+                    .as_ref()
+                    .map(|msg| (msg.content.clone(), msg.author.id.0)),
+            );
+        }
         messages.push((message.content.clone(), message.author.id.0));
         let mut contents = String::new();
         let mut prev_author = messages.first().unwrap().1;
@@ -194,7 +219,7 @@ impl Handler {
                     ts: DateTime::<Utc>::from_utc(dt, Utc),
                     author_id: row.get(4)?,
                     author_name: row.get(5)?,
-                    contents: row.get(6)?,
+                    contents: column_as_string(row.get_ref(6)?)?,
                     image: row.get(7)?,
                 })
             },
@@ -202,7 +227,7 @@ impl Handler {
         match res {
             Ok(q) => Ok(Some(q)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e).context("Error fetching quote"),
         }
     }
 
@@ -226,6 +251,30 @@ impl Handler {
             numbers[rand::random::<usize>() % numbers.len()]
         };
         self.fetch_quote(guild_id, number).await
+    }
+
+    pub async fn quotes_markov_chain(
+        &self,
+        guild_id: u64,
+        user: Option<u64>,
+    ) -> anyhow::Result<markov::Chain<String>> {
+        let db = self.db.lock().await;
+        let mut stmt = db.prepare(
+            "SELECT contents FROM quote WHERE guild_id = ?1 AND (?2 IS NULL or author_id = ?2)",
+        )?;
+        let mut chain = markov::Chain::new();
+        stmt.query(params![guild_id, user])?
+            .map(|row| column_as_string(row.get_ref(0)?))
+            .for_each(|quote: String| {
+                quote.split("- <@").enumerate().for_each(|(i, mut msg)| {
+                    if i > 0 {
+                        msg = msg.split_once('>').map(|(_, msg)| msg).unwrap_or(msg);
+                    }
+                    chain.feed_str(msg.trim());
+                });
+                Ok(())
+            })?;
+        Ok(chain)
     }
 
     pub async fn list_quotes(
