@@ -2,8 +2,8 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::quote;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Lit, Meta,
-    NestedMeta, PathArguments, Type,
+    parse_macro_input, Attribute, Data, DeriveInput, Fields, FieldsNamed, GenericArgument, Lit,
+    Meta, NestedMeta, PathArguments, Type,
 };
 
 struct Attr {
@@ -99,12 +99,13 @@ fn analyze_field(
                 .collect::<Vec<_>>()
                 .join("::");
             if segs.len() == 1 {
-                let (matcher, kind) = match parts.as_str() {
+                let parts_str = parts.as_str();
+                let (matcher, kind) = match parts_str {
                     "String" | "std::str::String" => (
                         quote!(#opt_value::String(v)),
                         quote!(serenity::model::application::command::CommandOptionType::String),
                     ),
-                    "i64" => (
+                    "i64" | "u64" | "usize" => (
                         quote!(#opt_value::Integer(v)),
                         quote!(serenity::model::application::command::CommandOptionType::Integer),
                     ),
@@ -135,15 +136,21 @@ fn analyze_field(
                         ))
                     }
                 };
+                let cast = if let "i64" | "u64" | "usize" | "isize" | "u32" | "i32" = parts_str {
+                    let id = Ident::new(parts_str, Span::call_site());
+                    quote!( as #id )
+                } else {
+                    quote!()
+                };
                 let getter = if required {
                     quote!(if let Some(#matcher) = #find_opt {
-                        v.clone()
+                        v.clone() #cast
                     } else {
                         panic!("Value is required")
                     })
                 } else {
                     quote!(if let Some(#matcher) = #find_opt {
-                        Some(v.clone())
+                        Some(v.clone() #cast)
                     } else {
                         None
                     })
@@ -208,6 +215,12 @@ fn derive(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
     let fields = match s.fields {
         Fields::Named(f) => f,
+        Fields::Unit => FieldsNamed {
+            brace_token: syn::token::Brace {
+                span: Span::call_site(),
+            },
+            named: Default::default(),
+        },
         _ => {
             return Err(syn::Error::new(
                 ident.span(),
