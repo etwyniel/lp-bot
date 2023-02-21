@@ -68,7 +68,7 @@ impl BotCommand for AlbumLookup {
             info.format_name(),
             info.release_date
                 .as_deref()
-                .map(|d| format!(" ({})", d))
+                .map(|d| format!(" ({d})"))
                 .unwrap_or_default(),
         );
         if info.genres.is_empty() {
@@ -77,7 +77,7 @@ impl BotCommand for AlbumLookup {
             }
         }
         if let Some(genres) = info.format_genres() {
-            _ = writeln!(&mut contents, "{}", &genres);
+            _ = writeln!(&mut contents, "{genres}");
         }
         contents.push_str(info.url.as_deref().unwrap_or("no link found"));
         Ok(CommandResponse::Public(contents))
@@ -247,7 +247,7 @@ impl GetQuote {
             })
             .description(&contents)
             .url(message_url)
-            .footer(|f| f.text(format!("in #{}", channel_name)))
+            .footer(|f| f.text(format!("in #{channel_name}")))
             .timestamp(quote.ts.format("%+").to_string());
         if let Some(image) = quote.image {
             create.image(image);

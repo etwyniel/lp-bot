@@ -95,7 +95,7 @@ impl Handler {
             Ok(m) => Some(m),
             Err(e) => {
                 // log error but carry on
-                eprintln!("Error getting member: {:#}", e);
+                eprintln!("Error getting member: {e:#}");
                 None
             }
         };
@@ -122,6 +122,49 @@ impl Handler {
             .filter(|at| at.height.is_some())
             .map(|at| at.url.as_str());
         let mut embeds = Vec::with_capacity(last_pin.embeds.len() + 1);
+        let footer_str = format!("Message pinned from #{channel_name} using LPBot");
+        // retrieve actual message in order to get potential reply
+        let msg = last_pin.channel_id.message(&ctx.http, last_pin.id).await?;
+        if let Some(reply) = &msg.referenced_message {
+            let author = &reply.author;
+            // retrieve user as guild member in order to get nickname and guild avatar
+            let member = match guild_id.member(&ctx.http, author).await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    // log error but carry on
+                    eprintln!("Error getting member: {e:#}");
+                    None
+                }
+            };
+            let name = member
+                .as_ref()
+                .and_then(|m| m.nick.as_deref())
+                .unwrap_or(&author.name);
+            let avatar = member
+                .as_ref()
+                .and_then(|member| member.avatar.clone())
+                .filter(|av| av.starts_with("http"))
+                .or_else(|| author.avatar_url())
+                .filter(|av| av.starts_with("http"));
+            // Filter attachments to find images
+            let image = reply
+                .attachments
+                .iter()
+                .filter(|at| at.height.is_some())
+                .map(|at| at.url.as_str())
+                .next();
+            if !reply.content.is_empty() || image.is_some() {
+                embeds.push(Embed::fake(|val| {
+                    image.map(|url| val.image(url));
+                    val.description(format!("{}", reply.content))
+                        .timestamp(reply.timestamp)
+                        .author(|author| {
+                            avatar.map(|av| author.icon_url(av));
+                            author.name(format!("Replying to {name}"))
+                        })
+                }))
+            }
+        }
         // put first image with the embed for message text
         let image = images.next();
         if !last_pin.content.is_empty() || image.is_some() {
@@ -132,19 +175,19 @@ impl Handler {
                     last_pin.content,
                     last_pin.link()
                 ))
-                .footer(|footer| {
-                    footer.text(format!("Message pinned from #{} using LPBot", channel_name))
-                })
+                .footer(|footer| footer.text(&footer_str))
                 .timestamp(last_pin.timestamp)
+                .author(|author| {
+                    avatar.as_ref().map(|av| author.icon_url(av));
+                    author.name(name)
+                })
             }))
         }
         // create embeds for remaining images
         embeds.extend(images.map(|img| {
             Embed::fake(|out| {
                 out.image(img)
-                    .footer(|f| {
-                        f.text(format!("Message pinned from #{} using LPBot", channel_name))
-                    })
+                    .footer(|f| f.text(&footer_str))
                     .timestamp(last_pin.timestamp)
             })
         }));

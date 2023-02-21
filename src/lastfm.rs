@@ -1,15 +1,18 @@
-use anyhow::Context as _;
-use chrono::{DateTime, Datelike, Utc};
-use futures::{StreamExt, TryStreamExt};
+use anyhow::{bail, Context as _};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use futures::{Future, Stream, StreamExt, TryStreamExt};
 use image::imageops::FilterType;
 use image::io::Reader;
 use image::{GenericImage, ImageOutputFormat, RgbaImage};
+use itertools::Itertools;
 use regex::Regex;
-use reqwest::{Client, Method, Url};
+use reqwest::{Client, Method, StatusCode, Url};
 use rspotify::ClientError;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serenity::async_trait;
+use serenity::builder::CreateEmbed;
+use serenity::json::JsonMap;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::prelude::interaction::InteractionResponseType;
 use serenity::model::prelude::AttachmentType;
@@ -31,6 +34,8 @@ use serenity_command_derive::Command;
 const API_ENDPOINT: &str = "http://ws.audioscrobbler.com/2.0/";
 
 const CHART_SQUARE_SIZE: u32 = 300;
+
+const TTL_DAYS: i64 = 30;
 
 pub struct Lastfm {
     client: Client,
@@ -137,7 +142,7 @@ pub struct Album {
 pub struct ArtistShort {
     pub url: String,
     pub name: String,
-    pub mbid: String,
+    pub mbid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,7 +281,7 @@ pub async fn create_aoty_chart(albums: &[TopAlbum], skip: bool) -> anyhow::Resul
     let mut futures = Vec::new();
     let mut offset = 0;
     for (mut i, album) in albums.iter().enumerate() {
-        let image_url = match album.image.iter().find(|img| &img.size == "large") {
+        let image_url = match album.image.iter().last() {
             Some(img) => img.url.clone(),
             None => {
                 offset += 1;
@@ -332,6 +337,9 @@ async fn retrieve_release_year(url: &str) -> anyhow::Result<Option<u64>> {
         .send()
         .await?;
     let status = resp.status();
+    if !status.is_success() {
+        bail!("{}", status.canonical_reason().unwrap_or_default());
+    }
     let text = resp.text().await?;
     let re = Regex::new(r"(?m)<dt.+>Release Date</dt>\s*<dd[^>]+>([^<]+)<").unwrap();
     if let Some(cap) = re.captures(&text) {
@@ -345,7 +353,6 @@ async fn retrieve_release_year(url: &str) -> anyhow::Result<Option<u64>> {
             .map_err(anyhow::Error::from)
             .map(Some)
     } else {
-        eprintln!("Resp ({})", status);
         Ok(None)
     }
 }
@@ -376,13 +383,12 @@ impl Lastfm {
                 .into_iter()
                 .fold(&mut pairs, |pairs, (k, v)| pairs.append_pair(k, v));
         }
-        self.client
-            .get(url)
-            .send()
-            .await?
-            .json()
-            .await
-            .map_err(anyhow::Error::from)
+        let resp = self.client.get(url).send().await?;
+        if resp.status() != StatusCode::OK {
+            let map: JsonMap = resp.json().await?;
+            bail!("Error getting top albums: {:?}", map);
+        }
+        resp.json().await.map_err(anyhow::Error::from)
     }
 
     pub async fn artist_top_tags(&self, artist: &str) -> anyhow::Result<Vec<String>> {
@@ -429,8 +435,19 @@ impl Lastfm {
         Ok(recent_tracks.recenttracks)
     }
 
-    pub async fn get_top_albums(&self, user: &str, page: Option<u64>) -> anyhow::Result<TopAlbums> {
-        let mut params: Vec<(&'static str, &str)> = vec![("user", user), ("limit", "200")];
+    pub async fn get_track_info(&self, artist: &str, name: &str) -> anyhow::Result<TrackInfo> {
+        let resp: TrackInfoResponse = self
+            .query("track.getInfo", [("artist", artist), ("track", name)])
+            .await?;
+        Ok(resp.track)
+    }
+
+    pub async fn get_top_albums(
+        self: Arc<Self>,
+        user: String,
+        page: Option<u64>,
+    ) -> anyhow::Result<TopAlbums> {
+        let mut params: Vec<(&'static str, &str)> = vec![("user", &user), ("limit", "200")];
 
         let page_s = page.map(|p| p.to_string());
         if let Some(page) = page_s.as_deref() {
@@ -441,6 +458,31 @@ impl Lastfm {
         Ok(top_albums.topalbums)
     }
 
+    pub fn top_albums_stream_inner(
+        self: Arc<Self>,
+        user: String,
+    ) -> impl Stream<Item = impl Future<Output = anyhow::Result<TopAlbums>>> {
+        tokio_stream::iter(1..).map(move |i| {
+            let user = user.clone();
+            let lfm = Arc::clone(&self);
+            eprintln!("querying page {i}");
+            lfm.get_top_albums(user, Some(i))
+        })
+    }
+
+    pub fn top_albums_stream(
+        self: Arc<Self>,
+        user: String,
+    ) -> impl Stream<Item = anyhow::Result<TopAlbums>> {
+        self.top_albums_stream_inner(user)
+            .buffered(4)
+            .try_take_while(|ta| {
+                let total_pages = ta.attr.total_pages.parse::<u64>().unwrap();
+                let page = ta.attr.page.parse::<u64>().unwrap();
+                async move { Ok(page <= total_pages) }
+            })
+    }
+
     pub async fn get_albums_of_the_year(
         self: Arc<Self>,
         db: Arc<Mutex<Connection>>,
@@ -449,157 +491,150 @@ impl Lastfm {
         year: u64,
     ) -> anyhow::Result<Vec<TopAlbum>> {
         let mut aotys = Vec::<TopAlbum>::new();
-        let mut page = 1;
-        let mut top_albums_fut = Some(tokio::spawn({
-            let user = user.to_string();
-            let lastfm = Arc::clone(&self);
-            let page = page;
-            async move { lastfm.get_top_albums(&user, Some(page)).await }
-        }));
-        loop {
-            eprintln!("Querying page {}", page);
-            let top_albums = match top_albums_fut.take() {
-                Some(fut) => fut.await?.context("Error getting top albums")?,
-                None => break,
-            };
-            let last_plays: Option<u64> = top_albums
-                .album
-                .last()
-                .map(|ab| ab.playcount.parse().unwrap());
-            let total_pages = top_albums
-                .attr
-                .total_pages
-                .parse::<u64>()
-                .context("Invalid response from last.fm")?;
-            if page < total_pages && last_plays.unwrap_or_default() >= 10 {
-                page += 1;
-                top_albums_fut = Some(tokio::spawn({
-                    let user = user.to_string();
-                    let lastfm = Arc::clone(&self);
-                    let page = page;
-                    async move { lastfm.get_top_albums(&user, Some(page)).await }
-                }));
-            }
-            let tuples = top_albums
-                .album
-                .iter()
-                .enumerate()
-                .map(|(i, ab)| (ab.artist.name.as_str(), ab.name.as_str(), i));
-            let res = crate::db::get_release_years(&db, tuples).await?;
-            let mut years: Vec<Option<u64>> = vec![None; top_albums.album.len()];
-            res.into_iter().for_each(|(i, year)| years[i] = Some(year));
-            let fetches = futures::stream::iter(
-                top_albums
+        Arc::clone(&self)
+            .top_albums_stream(user.to_string())
+            .try_take_while(|ta| {
+                let last_plays = ta
+                    .album
+                    .last()
+                    .map(|ab| ab.playcount.parse::<u64>().unwrap())
+                    .unwrap_or_default();
+                async move { Ok(last_plays >= 4) }
+            })
+            .try_fold(&mut aotys, |aotys, top_albums| async {
+                let tuples = top_albums
                     .album
                     .iter()
-                    .cloned()
-                    .zip(years.into_iter())
                     .enumerate()
-                    .filter(|(_, (ab, yr))| {
-                        ab.playcount.parse::<u64>().unwrap() > 10
-                            && yr.map(|yr| yr == year).unwrap_or(true)
-                    })
-                    .map(|(i, (ab, yr))| {
-                        tokio::spawn({
-                            let db = Arc::clone(&db);
-                            let spotify = Arc::clone(&spotify);
-                            let name = ab.name.clone();
-                            let artist = ab.artist.name.clone();
-                            let album = ab.name.clone();
-                            let url = ab.url;
-                            async move {
-                                // Backoff loop
-                                if let Some(year) = yr {
-                                    return Ok((i, Some(year)));
-                                }
-                                let lastfm_release_year = retrieve_release_year(&url).await;
-                                match lastfm_release_year {
-                                    Ok(Some(year)) => {
-                                        crate::db::set_release_year(&db, &artist, &album, year)
-                                            .await?;
-                                        return Ok((i, Some(year)));
-                                    }
-                                    Err(e) => eprintln!(
-                                        "Error getting release year from lastfm: {}",
-                                        e
-                                    ),
-                                    _ => (),
-                                }
-                                eprintln!("Release date for {} - {} not found in cache or on lastfm, trying spotify", &artist, &album);
-                                loop {
-                                    match spotify.get_album(&artist, &album).await {
-                                        Ok(Some(crate::album::Album {
-                                            release_date: Some(date),
-                                            ..
-                                        })) => {
-                                            let year =
-                                                date.split('-').next().unwrap().parse().unwrap();
-                                            crate::db::set_release_year(&db, &artist, &name, year)
-                                                .await?;
-                                            break Ok((i, Some(year)));
-                                        }
-                                        Ok(_) => {
-                                            eprintln!("No release year found for {}", &url);
-                                            break Ok((i, None));
-                                        }
-                                        Err(e) => {
-                                            let mut retry = false;
-                                            for err in e.chain() {
-                                                if let Some(ClientError::Http(http_err)) =
-                                                    err.downcast_ref()
-                                                {
-                                                    if let rspotify_http::HttpError::StatusCode(
-                                                        code,
-                                                    ) = http_err.as_ref()
-                                                    {
-                                                        if code.status() == 429 {
-                                                            retry = true;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if &e.to_string() == "Not found" {
-                                                break Ok((i, None));
-                                            }
-                                            if !retry {
-                                                eprintln!(
-                                                    "query {} {} failed: {:?}",
-                                                    &artist, &name, &e
-                                                );
-                                                break Err(e);
-                                            }
-                                            // Wait before retrying
-                                            tokio::time::sleep(Duration::from_secs(5)).await;
-                                        }
-                                    }
-                                }
-                            }
+                    .map(|(i, ab)| (ab.artist.name.as_str(), ab.name.as_str(), i));
+                let res = crate::db::get_release_years(&db, tuples).await?;
+                let mut years: Vec<Result<u64, u64>> = vec![Err(0); top_albums.album.len()];
+                res.into_iter().for_each(|(i, year)| years[i] = year);
+                let fetches = futures::stream::iter(
+                    top_albums
+                        .album
+                        .iter()
+                        .cloned()
+                        .zip(years.into_iter())
+                        .enumerate()
+                        .filter(|(_, (ab, yr))| {
+                            ab.playcount.parse::<u64>().unwrap() >= 4
+                                && yr.map(|yr| yr == year).unwrap_or(true)
                         })
-                    }),
-            )
-            .buffer_unordered(10)
-            .map(|res| match res {
-                Ok(inner) => inner,
-                Err(e) => Err(anyhow::Error::from(e)),
+                        .map(|(i, (ab, yr))| {
+                            tokio::spawn({
+                                let year_fut = get_release_year(
+                                    Arc::clone(&db),
+                                    Arc::clone(&spotify),
+                                    ab.artist.name.clone(),
+                                    ab.name.clone(),
+                                    ab.url,
+                                );
+                                async move {
+                                    // Backoff loop
+                                    match yr {
+                                        Ok(year) => return Ok((i, Some(year))),
+                                        Err(last_checked)
+                                            if (Utc::now()
+                                                - Utc.timestamp(last_checked as i64, 0))
+                                            .num_days()
+                                                < TTL_DAYS =>
+                                        {
+                                            return Ok((i, None));
+                                        }
+                                        _ => {}
+                                    }
+                                    // if let Some(year) = yr {
+                                    //     return Ok((i, Some(year)));
+                                    // }
+                                    year_fut.await.map(|yr| (i, yr))
+                                }
+                            })
+                        }),
+                )
+                .buffer_unordered(100)
+                .map(|res| match res {
+                    Ok(inner) => inner,
+                    Err(e) => Err(anyhow::Error::from(e)),
+                })
+                .map(|res| match res {
+                    Ok((i, yr)) => Ok((i, yr == Some(year))),
+                    Err(e) => Err(e),
+                })
+                .try_collect::<HashMap<usize, bool>>();
+                let album_infos = fetches.await?;
+                aotys.extend(
+                    top_albums
+                        .album
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, _)| album_infos.get(i).copied() == Some(true))
+                        .map(|(_, ab)| ab),
+                );
+                Ok(aotys)
             })
-            .map(|res| match res {
-                Ok((i, yr)) => Ok((i, yr == Some(year))),
-                Err(e) => Err(e),
-            })
-            .try_collect::<HashMap<usize, bool>>();
-            let album_infos = fetches.await?;
-            aotys.extend(
-                top_albums
-                    .album
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| album_infos.get(i).copied() == Some(true))
-                    .map(|(_, ab)| ab),
-            );
-            if top_albums_fut.is_none() || aotys.len() >= 25 {
-                break;
+            .await?;
+        Ok(aotys)
+    }
+}
+
+fn err_is_status_code(e: &anyhow::Error, expected: u16) -> bool {
+    for err in e.chain() {
+        if let Some(ClientError::Http(http_err)) = err.downcast_ref() {
+            if let rspotify_http::HttpError::StatusCode(code) = http_err.as_ref() {
+                if code.status() == expected {
+                    return true;
+                }
             }
         }
-        Ok(aotys)
+    }
+    false
+}
+
+async fn get_release_year(
+    db: Arc<Mutex<Connection>>,
+    spotify: Arc<Spotify>,
+    artist: String,
+    album: String,
+    url: String,
+) -> anyhow::Result<Option<u64>> {
+    // Backoff loop
+    let lastfm_release_year = retrieve_release_year(&url).await;
+    match lastfm_release_year {
+        Ok(Some(year)) => {
+            crate::db::set_release_year(&db, &artist, &album, year).await?;
+            return Ok(Some(year));
+        }
+        Err(e) => eprintln!("Error getting release year from lastfm: {e}"),
+        _ => (),
+    }
+    loop {
+        match spotify.get_album(&artist, &album).await {
+            Ok(Some(crate::album::Album {
+                release_date: Some(date),
+                ..
+            })) => {
+                let year = date.split('-').next().unwrap().parse().unwrap();
+                crate::db::set_release_year(&db, &artist, &album, year).await?;
+                break Ok(Some(year));
+            }
+            Ok(_) => {
+                eprintln!("No release year found for {}", &url);
+                crate::db::set_last_checked(&db, &artist, &album).await?;
+                break Ok(None);
+            }
+            Err(e) => {
+                let retry = err_is_status_code(&e, 429);
+                if &e.to_string() == "Not found" {
+                    break Ok(None);
+                }
+                if !retry {
+                    eprintln!("query {} {} failed: {:?}", &artist, &album, &e);
+                    break Err(e);
+                }
+                // Wait before retrying
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     }
 }

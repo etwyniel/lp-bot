@@ -330,13 +330,19 @@ impl Handler {
     }
 }
 
-pub fn get_release_year(db: &Connection, artist: &str, album: &str) -> Option<u64> {
-    db.query_row(
-        "SELECT year FROM album_cache WHERE artist = ?1 AND album = ?2",
-        [artist, album],
-        |row| row.get(0),
-    )
-    .ok()
+pub fn get_release_year(db: &Connection, artist: &str, album: &str) -> Result<u64, u64> {
+    let (year, last_checked): (Option<u64>, Option<u64>) = db
+        .query_row(
+            "SELECT year, last_checked FROM album_cache WHERE artist = ?1 AND album = ?2",
+            [artist, album],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None));
+    match (year, last_checked) {
+        (Some(year), _) => Ok(year),
+        (None, Some(last_checked)) => Err(last_checked),
+        (None, None) => Err(0),
+    }
 }
 
 pub async fn set_release_year(
@@ -351,6 +357,17 @@ pub async fn set_release_year(
     Ok(())
 }
 
+pub async fn set_last_checked(
+    db: &Mutex<Connection>,
+    artist: &str,
+    album: &str,
+) -> anyhow::Result<()> {
+    let db = db.lock().await;
+    db.execute("INSERT INTO album_cache (artist, album, last_checked) VALUES (?1, ?2, ?3) ON CONFLICT(artist, album) DO NOTHING",
+    params![artist, album, Utc::now().timestamp()])?;
+    Ok(())
+}
+
 pub fn escape_str(s: &str) -> Cow<'_, str> {
     if !s.contains('\'') {
         return Cow::Borrowed(s);
@@ -361,7 +378,7 @@ pub fn escape_str(s: &str) -> Cow<'_, str> {
 pub async fn get_release_years<'a, I: IntoIterator<Item = (&'a str, &'a str, usize)>>(
     db: &Mutex<Connection>,
     albums: I,
-) -> anyhow::Result<Vec<(usize, u64)>> {
+) -> anyhow::Result<Vec<(usize, Result<u64, u64>)>> {
     let mut query = "WITH albums_in(artist, album, pos) AS(VALUES".to_string();
     albums.into_iter().enumerate().for_each(|(i, ab)| {
         if i > 0 {
@@ -378,7 +395,7 @@ pub async fn get_release_years<'a, I: IntoIterator<Item = (&'a str, &'a str, usi
     });
     query.push_str(
         ")
-        SELECT albums_in.pos, album_cache.year
+        SELECT albums_in.pos, album_cache.year, album_cache.last_checked
         FROM album_cache JOIN albums_in
         ON albums_in.artist = album_cache.artist
         AND albums_in.album = album_cache.album",
@@ -387,7 +404,11 @@ pub async fn get_release_years<'a, I: IntoIterator<Item = (&'a str, &'a str, usi
     let mut stmt = db.prepare(&query)?;
     let res = stmt
         .query([])?
-        .map(|row| Ok((row.get(0)?, row.get(1)?)))
+        .map(|row| {
+            let year: Option<u64> = row.get(1)?;
+            let last_checked: Option<u64> = row.get(2)?;
+            Ok((row.get(0)?, year.ok_or(last_checked.unwrap_or_default())))
+        })
         .collect()
         .map_err(anyhow::Error::from);
     res
@@ -444,7 +465,8 @@ pub fn init() -> anyhow::Result<Connection> {
         "CREATE TABLE IF NOT EXISTS album_cache (
             artist STRING NOT NULL,
             album STRING NOT NULL,
-            year INTEGER NOT NULL,
+            year INTEGER,
+            last_checked INTEGER,
             UNIQUE(artist, album)
         )",
         [],

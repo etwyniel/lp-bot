@@ -43,7 +43,7 @@ impl Album {
 
     pub fn format_name(&self) -> String {
         match (&self.name, &self.artist) {
-            (Some(n), Some(a)) => format!("{} - {}", a, n),
+            (Some(n), Some(a)) => format!("{a} - {n}"),
             (Some(n), None) => n.to_string(),
             _ => "this".to_string(),
         }

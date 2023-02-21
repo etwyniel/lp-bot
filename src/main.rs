@@ -176,7 +176,7 @@ impl Handler {
                     let quote_number = self.add_quote(guild_id, message).await?;
                     let link = message.id.link(message.channel_id, Some(GuildId(guild_id)));
                     let resp_text = match quote_number {
-                        Some(n) => format!("Quote saved as #{}: {}", n, link),
+                        Some(n) => format!("Quote saved as #{n}: {link}"),
                         None => "Quote already added".to_string(),
                     };
                     Ok(CommandResponse::Public(resp_text))
@@ -208,7 +208,7 @@ impl Handler {
                             let header = if let Some(server) =
                                 cmd.command.guild_id.and_then(|g| g.name(ctx))
                             {
-                                format!("Birthdays in {}", server)
+                                format!("Birthdays in {server}")
                             } else {
                                 "Birthdays".to_string()
                             };
@@ -429,7 +429,7 @@ async fn bday_loop(db: Arc<Mutex<Connection>>, http: Arc<Http>) {
         };
         for (guild_id, user_id) in guilds_and_users {
             if let Err(e) = wish_bday(http.as_ref(), user_id, GuildId(guild_id)).await {
-                eprintln!("Error wishing user birthday: {:?}", e);
+                eprintln!("Error wishing user birthday: {e:?}");
             }
         }
     }
@@ -484,7 +484,7 @@ impl EventHandler for Handler {
             };
 
             if let Err(why) = command.respond(&ctx.http, resp, None).await {
-                eprintln!("cannot respond to slash command: {:?}", why);
+                eprintln!("cannot respond to slash command: {why:?}");
                 return;
             }
         }
@@ -506,7 +506,7 @@ impl EventHandler for Handler {
                 Ok(Some(n)) => n,
                 Ok(None) => return,
                 Err(e) => {
-                    eprintln!("Error adding quote: {:?}", e);
+                    eprintln!("Error adding quote: {e:?}");
                     return;
                 }
             };
@@ -514,7 +514,7 @@ impl EventHandler for Handler {
                 g.send_message(&ctx.http, |m| {
                     m.reference_message((g.id, message.id))
                         .allowed_mentions(|mentions| mentions.empty_users())
-                        .content(&format!("Quote saved as #{}", number))
+                        .content(&format!("Quote saved as #{number}"))
                 })
                 .await
                 .unwrap();
@@ -529,7 +529,7 @@ impl EventHandler for Handler {
             ready.guilds.len()
         );
         self.http.set(Arc::clone(&ctx.http)).unwrap();
-        _ = tokio::spawn(bday_loop(Arc::clone(&self.db), Arc::clone(&ctx.http)));
+        tokio::spawn(bday_loop(Arc::clone(&self.db), Arc::clone(&ctx.http)));
 
         let guild_id = GuildId(
             env::var("GUILD_ID")
@@ -609,7 +609,7 @@ impl EventHandler for Handler {
 
     async fn message(&self, ctx: Context, new_message: Message) {
         if let Err(e) = self.process_message(ctx, new_message).await {
-            eprintln!("Error processing message: {:?}", e);
+            eprintln!("Error processing message: {e:?}");
         }
     }
 
@@ -633,7 +633,7 @@ impl EventHandler for Handler {
             .move_pin_to_pinboard(&ctx, pin.channel_id, guild_id)
             .await
         {
-            eprintln!("Error moving message to pinboard: {:?}", e);
+            eprintln!("Error moving message to pinboard: {e:?}");
         }
     }
 }
@@ -643,7 +643,7 @@ async fn main() {
     let handler = match Handler::new().await {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("Initialization failed: {:?}", e);
+            eprintln!("Initialization failed: {e:?}");
             return;
         }
     };
@@ -673,6 +673,6 @@ async fn main() {
     // Shards will automatically attempt to reconnect, and will perform
     // exponential backoff until it reconnects.
     if let Err(why) = client.start().await {
-        println!("Client error: {:?}", why);
+        println!("Client error: {why:?}");
     }
 }
