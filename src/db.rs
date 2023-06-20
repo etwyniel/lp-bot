@@ -62,7 +62,7 @@ impl Handler {
     pub async fn get_guild_field<T: FromSql>(&self, field: &str, guild_id: u64) -> Option<T> {
         let db = self.db.lock().await;
         db.query_row(
-            &format!("SELECT {} FROM guild WHERE id = ?1", field),
+            &format!("SELECT {field} FROM guild WHERE id = ?1"),
             [guild_id],
             |row| row.get(0),
         )
@@ -78,7 +78,7 @@ impl Handler {
         self.ensure_guild_table(guild_id).await?;
         let db = self.db.lock().await;
         db.execute(
-            &format!("UPDATE guild SET {} = ?2 WHERE id = ?1", field),
+            &format!("UPDATE guild SET {field} = ?2 WHERE id = ?1"),
             params![guild_id, value],
         )?;
         Ok(())
@@ -103,12 +103,16 @@ impl Handler {
     }
 
     pub async fn message_to_quote_contents(&self, message: &Message) -> anyhow::Result<String> {
-        let prev_react = message
+        let quote_ndx = message
             .reactions
             .iter()
-            .tuple_windows()
-            .find(|(_, r)| r.reaction_type == ReactionType::Unicode("🗨️".to_string()))
-            .map(|(l, _)| &l.reaction_type);
+            .find_position(|r| r.reaction_type == ReactionType::Unicode("🗨️".to_string()))
+            .map(|(ndx, _)| ndx)
+            .unwrap_or(message.reactions.len());
+        let prev_react = message
+            .reactions
+            .get(quote_ndx.wrapping_sub(1))
+            .map(|r| &r.reaction_type);
         let mut messages: Vec<(String, u64)> = Default::default();
         if let Some(ReactionType::Unicode(emoji)) = prev_react {
             let first_byte = emoji.as_bytes()[0];

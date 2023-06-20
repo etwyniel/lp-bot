@@ -1,5 +1,6 @@
 use anyhow::{bail, Context as _};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
+use fallible_iterator::FallibleIterator;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use image::imageops::FilterType;
 use image::io::Reader;
@@ -8,7 +9,7 @@ use itertools::Itertools;
 use regex::Regex;
 use reqwest::{Client, Method, StatusCode, Url};
 use rspotify::ClientError;
-use rusqlite::Connection;
+use rusqlite::params;
 use serde::Deserialize;
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
@@ -18,18 +19,19 @@ use serenity::model::prelude::interaction::InteractionResponseType;
 use serenity::model::prelude::AttachmentType;
 use serenity::prelude::{Context, Mutex};
 use serenity_command::{BotCommand, CommandResponse};
-use serenity_command_handler::Module;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
+use std::fmt::Write;
 use std::io::Cursor;
 use std::iter::IntoIterator;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::spotify::Spotify;
-use crate::Handler;
+use crate::db::Db;
+use crate::modules::Spotify;
+use crate::prelude::*;
 use serenity_command_derive::Command;
 
 const API_ENDPOINT: &str = "http://ws.audioscrobbler.com/2.0/";
@@ -253,7 +255,7 @@ impl BotCommand for GetAotys {
             r.kind(InteractionResponseType::DeferredChannelMessageWithSource)
         })
         .await?;
-        if let Err(e) = self.get_aotys(handler, opts).await {
+        if let Err(e) = self.get_aotys(handler, ctx, opts).await {
             eprintln!("get aotys failed: {:?}", &e);
             opts.create_followup_message(&ctx.http, |resp| resp.content(e.to_string()))
                 .await?;
@@ -266,18 +268,20 @@ impl GetAotys {
     async fn get_aotys(
         self,
         handler: &Handler,
+        ctx: &Context,
         opts: &ApplicationCommandInteraction,
     ) -> anyhow::Result<()> {
-        let lastfm = Arc::clone(&handler.lastfm);
+        let lastfm: Arc<Lastfm> = handler.module_arc()?;
+        let spotify: Arc<Spotify> = handler.module_arc()?;
         let db = Arc::clone(&handler.db);
         let year = self
             .year
             .map(|yr| yr as u64)
-            .unwrap_or_else(|| Utc::today().year() as u64);
+            .unwrap_or_else(|| Utc::now().year() as u64);
         let mut aotys = lastfm
-            .get_albums_of_the_year(db, Arc::clone(&handler.spotify), &self.username, year)
+            .get_albums_of_the_year(db, spotify, &self.username, year)
             .await?;
-        let http = handler.http();
+        let http = &ctx.http;
         if aotys.is_empty() {
             opts.create_followup_message(http, |msg| {
                 msg.content(format!(
@@ -396,7 +400,7 @@ impl BotCommand for GetSotys {
             r.kind(InteractionResponseType::DeferredChannelMessageWithSource)
         })
         .await?;
-        self.get_soty(handler, opts).await?;
+        self.get_soty(handler, ctx, opts).await?;
         Ok(CommandResponse::None)
     }
 }
@@ -405,16 +409,19 @@ impl GetSotys {
     async fn get_soty(
         self,
         handler: &Handler,
+        ctx: &Context,
         opts: &ApplicationCommandInteraction,
     ) -> anyhow::Result<()> {
         let year = self
             .year
             .map(|yr| yr as u64)
-            .unwrap_or_else(|| Utc::today().year() as u64);
-        let mut songs = Arc::clone(&handler.lastfm)
+            .unwrap_or_else(|| Utc::now().year() as u64);
+        let lastfm: Arc<Lastfm> = handler.module_arc()?;
+        let spotify: Arc<Spotify> = handler.module_arc()?;
+        let mut songs = lastfm
             .get_songs_of_the_year(
                 Arc::clone(&handler.db),
-                Arc::clone(&handler.spotify),
+                spotify,
                 self.username.clone(),
                 year,
             )
@@ -432,7 +439,7 @@ impl GetSotys {
         let mut embed = CreateEmbed::default();
         embed.description(content);
         embed.title(format!("Top songs of {year} for {}", &self.username));
-        opts.edit_original_interaction_response(handler.http(), |resp| {
+        opts.edit_original_interaction_response(&ctx.http, |resp| {
             resp.embed(|e| {
                 *e = embed;
                 e
@@ -612,7 +619,7 @@ impl Lastfm {
 
     pub async fn get_albums_of_the_year(
         self: Arc<Self>,
-        db: Arc<Mutex<Connection>>,
+        db: Arc<Mutex<Db>>,
         spotify: Arc<Spotify>,
         user: &str,
         year: u64,
@@ -634,7 +641,7 @@ impl Lastfm {
                     .iter()
                     .enumerate()
                     .map(|(i, ab)| (ab.artist.name.as_str(), ab.name.as_str(), i));
-                let res = crate::db::get_release_years(&db, tuples).await?;
+                let res = get_release_years(&db, tuples).await?;
                 let mut years: Vec<Result<u64, u64>> = vec![Err(0); top_albums.album.len()];
                 res.into_iter().for_each(|(i, year)| years[i] = year);
                 let fetches = futures::stream::iter(
@@ -706,7 +713,7 @@ impl Lastfm {
 
     pub async fn get_songs_of_the_year(
         self: Arc<Self>,
-        db: Arc<Mutex<Connection>>,
+        db: Arc<Mutex<Db>>,
         spotify: Arc<Spotify>,
         user: String,
         year: u64,
@@ -748,7 +755,7 @@ impl Lastfm {
                 let Some(album) = info.album else { continue };
                 let cached_year = {
                     let db = db.lock().await;
-                    crate::db::get_release_year(&db, &album.artist, &album.title)
+                    get_release_year_db(&db, &album.artist, &album.title)
                 };
                 let Some(yr) = (match cached_year {
                     Ok(year) => Some(year),
@@ -783,6 +790,12 @@ impl Lastfm {
     }
 }
 
+impl Default for Lastfm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn err_is_status_code(e: &anyhow::Error, expected: u16) -> bool {
     for err in e.chain() {
         if let Some(ClientError::Http(http_err)) = err.downcast_ref() {
@@ -797,7 +810,7 @@ fn err_is_status_code(e: &anyhow::Error, expected: u16) -> bool {
 }
 
 async fn get_release_year(
-    db: Arc<Mutex<Connection>>,
+    db: Arc<Mutex<Db>>,
     spotify: Arc<Spotify>,
     artist: String,
     album: String,
@@ -807,7 +820,7 @@ async fn get_release_year(
     let lastfm_release_year = retrieve_release_year(&url).await;
     match lastfm_release_year {
         Ok(Some(year)) => {
-            crate::db::set_release_year(&db, &artist, &album, year).await?;
+            set_release_year(&db, &artist, &album, year).await?;
             return Ok(Some(year));
         }
         Err(e) => eprintln!("Error getting release year from lastfm: {e}"),
@@ -820,12 +833,12 @@ async fn get_release_year(
                 ..
             })) => {
                 let year = date.split('-').next().unwrap().parse().unwrap();
-                crate::db::set_release_year(&db, &artist, &album, year).await?;
+                set_release_year(&db, &artist, &album, year).await?;
                 break Ok(Some(year));
             }
             Ok(_) => {
                 eprintln!("No release year found for {}", &url);
-                crate::db::set_last_checked(&db, &artist, &album).await?;
+                set_last_checked(&db, &artist, &album).await?;
                 break Ok(None);
             }
             Err(e) => {
@@ -844,9 +857,105 @@ async fn get_release_year(
     }
 }
 
+pub async fn get_release_years<'a, I: IntoIterator<Item = (&'a str, &'a str, usize)>>(
+    db: &Mutex<Db>,
+    albums: I,
+) -> anyhow::Result<Vec<(usize, Result<u64, u64>)>> {
+    let mut query = "WITH albums_in(artist, album, pos) AS(VALUES".to_string();
+    albums.into_iter().enumerate().for_each(|(i, ab)| {
+        if i > 0 {
+            query.push(',');
+        }
+        write!(
+            &mut query,
+            "('{}', '{}', {})",
+            crate::db::escape_str(ab.0),
+            crate::db::escape_str(ab.1),
+            ab.2
+        )
+        .unwrap();
+    });
+    query.push_str(
+        ")
+        SELECT albums_in.pos, album_cache.year, album_cache.last_checked
+        FROM album_cache JOIN albums_in
+        ON albums_in.artist = album_cache.artist
+        AND albums_in.album = album_cache.album",
+    );
+    let db = db.lock().await;
+    let mut stmt = db.conn.prepare(&query)?;
+    let res = stmt
+        .query([])?
+        .map(|row| {
+            let year: Option<u64> = row.get(1)?;
+            let last_checked: Option<u64> = row.get(2)?;
+            Ok((row.get(0)?, year.ok_or(last_checked.unwrap_or_default())))
+        })
+        .collect()
+        .map_err(anyhow::Error::from);
+    res
+}
+
+async fn set_release_year(
+    db: &Mutex<Db>,
+    artist: &str,
+    album: &str,
+    year: u64,
+) -> anyhow::Result<()> {
+    let db = db.lock().await;
+    db.conn.execute("INSERT INTO album_cache (artist, album, year) VALUES (?1, ?2, ?3) ON CONFLICT(artist, album) DO NOTHING",
+    params![artist, album, year])?;
+    Ok(())
+}
+
+async fn set_last_checked(db: &Mutex<Db>, artist: &str, album: &str) -> anyhow::Result<()> {
+    let db = db.lock().await;
+    db.conn.execute("INSERT INTO album_cache (artist, album, last_checked) VALUES (?1, ?2, ?3) ON CONFLICT(artist, album) DO NOTHING",
+    params![artist, album, Utc::now().timestamp()])?;
+    Ok(())
+}
+
+fn get_release_year_db(db: &Db, artist: &str, album: &str) -> Result<u64, u64> {
+    let (year, last_checked): (Option<u64>, Option<u64>) = db
+        .conn
+        .query_row(
+            "SELECT year, last_checked FROM album_cache WHERE artist = ?1 AND album = ?2",
+            [artist, album],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None));
+    match (year, last_checked) {
+        (Some(year), _) => Ok(year),
+        (None, Some(last_checked)) => Err(last_checked),
+        (None, None) => Err(0),
+    }
+}
+
 #[async_trait]
 impl Module for Lastfm {
-    async fn init() -> anyhow::Result<Self> {
+    async fn init(_: &ModuleMap) -> anyhow::Result<Self> {
         Ok(Lastfm::new())
+    }
+
+    async fn add_dependencies(builder: HandlerBuilder) -> anyhow::Result<HandlerBuilder> {
+        builder.module::<Spotify>().await
+    }
+
+    async fn setup(&mut self, db: &mut Db) -> anyhow::Result<()> {
+        db.conn.execute(
+            "CREATE TABLE IF NOT EXISTS album_cache (
+            artist STRING NOT NULL,
+            album STRING NOT NULL,
+            year INTEGER,
+            last_checked INTEGER,
+            UNIQUE(artist, album)
+        )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn register_commands(&self, store: &mut CommandStore, _completions: &mut CompletionStore) {
+        store.register::<GetAotys>();
     }
 }

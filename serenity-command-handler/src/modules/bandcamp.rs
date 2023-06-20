@@ -1,8 +1,8 @@
+use crate::{Module, ModuleMap};
 use anyhow::anyhow;
 use reqwest::{Client, Url};
 use scraper::{Html, Selector};
 use serenity::async_trait;
-use serenity_command_handler::Module;
 
 use crate::album::{Album, AlbumProvider};
 
@@ -135,9 +135,15 @@ impl Bandcamp {
     }
 }
 
+impl Default for Bandcamp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Module for Bandcamp {
-    async fn init() -> anyhow::Result<Self> {
+    async fn init(_: &ModuleMap) -> anyhow::Result<Self> {
         Ok(Bandcamp::new())
     }
 }

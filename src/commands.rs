@@ -8,13 +8,13 @@ use serenity::{
     model::prelude::{GuildId, Role, UserId},
     prelude::Context,
 };
-use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
+use serenity_command::{BotCommand, CommandBuilder, CommandKey, CommandResponse, CommandRunner};
 use serenity_command_derive::Command;
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::lastfm::GetAotys;
+use crate::lastfm::{GetAotys, GetSotys};
 use crate::reltime::Relative;
 use crate::Handler;
 
@@ -491,7 +491,7 @@ impl BotCommand for RemoveAutoreact {
 }
 
 pub fn register_commands(
-    commands: &mut HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>,
+    commands: &mut HashMap<CommandKey<'static>, Box<dyn CommandRunner<Handler> + Send + Sync>>,
 ) {
     let mut add = |runner: Box<dyn CommandRunner<Handler> + Send + Sync>| {
         commands.insert(runner.name(), runner)
@@ -507,6 +507,7 @@ pub fn register_commands(
     add(AddAutoreact::runner());
     add(RemoveAutoreact::runner());
     add(GetAotys::runner());
+    add(GetSotys::runner());
     add(ReadyPoll::runner());
     add(FakeQuote::runner());
 }

@@ -3,7 +3,9 @@ use serenity::builder::{CreateApplicationCommand, CreateApplicationCommandOption
 use serenity::model::application::interaction::application_command::{
     ApplicationCommandInteraction, CommandData,
 };
+use serenity::model::prelude::command::CommandType;
 use serenity::model::prelude::interaction::MessageFlags;
+use serenity::model::prelude::GuildId;
 use serenity::model::Permissions;
 use serenity::prelude::Context;
 
@@ -14,6 +16,8 @@ pub enum CommandResponse {
     Private(String),
     Embed(CreateEmbed),
 }
+
+pub type CommandKey<'a> = (&'a str, CommandType);
 
 #[async_trait]
 pub trait BotCommand {
@@ -28,6 +32,7 @@ pub trait BotCommand {
     fn setup_options(_opt_name: &'static str, _opt: &mut CreateApplicationCommandOption) {}
 
     const PERMISSIONS: Permissions = Permissions::empty();
+    const GUILD: Option<GuildId> = None;
 }
 
 impl CommandResponse {
@@ -48,6 +53,7 @@ pub trait CommandBuilder<'a>: BotCommand + From<&'a CommandData> + 'static {
     ) -> &mut CreateApplicationCommand;
     fn create(builder: &mut CreateApplicationCommand) -> &mut CreateApplicationCommand;
     const NAME: &'static str;
+    const TYPE: CommandType = CommandType::ChatInput;
     fn runner() -> Box<dyn CommandRunner<Self::Data> + Send + Sync>;
 }
 
@@ -59,9 +65,13 @@ pub trait CommandRunner<T> {
         ctx: &Context,
         interaction: &ApplicationCommandInteraction,
     ) -> anyhow::Result<CommandResponse>;
-    fn name(&self) -> &'static str;
+    fn name(&self) -> CommandKey<'static>;
     fn register<'a>(
         &self,
         builder: &'a mut CreateApplicationCommand,
     ) -> &'a mut CreateApplicationCommand;
+
+    fn guild(&self) -> Option<GuildId> {
+        None
+    }
 }

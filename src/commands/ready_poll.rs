@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serenity::model::id::InteractionId;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::prelude::{Reaction, ReactionType};
+use serenity::prelude::Mutex;
 use serenity::{async_trait, prelude::Context};
 use serenity_command::{BotCommand, CommandResponse};
 use serenity_command_derive::Command;
+use serenity_command_handler::Module;
 
 use crate::Handler;
 
@@ -89,4 +92,16 @@ pub async fn handle_ready_poll(handler: &Handler, react: &Reaction) -> anyhow::R
     handler
         .crabdown(http, msg.channel_id, count.as_deref(), go.as_deref())
         .await
+}
+
+#[derive(Default)]
+pub struct ModPoll {
+    ready_polls: Arc<Mutex<PendingPolls>>,
+}
+
+#[async_trait]
+impl Module for ModPoll {
+    async fn init() -> anyhow::Result<Self> {
+        Ok(Default::default())
+    }
 }

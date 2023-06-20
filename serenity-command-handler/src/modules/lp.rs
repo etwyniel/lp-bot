@@ -2,27 +2,30 @@ use std::borrow::Cow;
 use std::fmt::Write;
 use std::ops::Add;
 
+use crate::{db::Db, CommandStore, HandlerBuilder, Module};
 use anyhow::bail;
 use chrono::{prelude::*, Duration};
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use regex::Regex;
 use serenity::async_trait;
 use serenity::client::Context;
 use serenity::model::application::interaction::application_command::CommandDataOption;
 use serenity::model::channel::ChannelType;
 use serenity::model::id::GuildId;
+use serenity::model::prelude::command::CommandType;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::prelude::interaction::autocomplete::AutocompleteInteraction;
 use serenity_command_derive::Command;
-use serenity_command_handler::db::Db;
-use serenity_command_handler::{CommandStore, HandlerBuilder, Module};
 
 use crate::album::Album;
-use crate::bandcamp::Bandcamp;
 use crate::command_context::{get_focused_option, get_str_opt_ac, Responder};
-use crate::lastfm::Lastfm;
-use crate::spotify::Spotify;
-use crate::Handler;
-use crate::{BotCommand, InteractionExt};
+use crate::modules::{Bandcamp, Lastfm, Spotify};
+use crate::prelude::*;
 use serenity_command::CommandResponse;
+use serenity_command::{BotCommand, CommandKey};
+
+use super::AlbumLookup;
 
 #[derive(Command)]
 #[cmd(name = "lp", desc = "run a listening party")]
@@ -79,7 +82,12 @@ async fn get_lastfm_genres(handler: &Handler, info: &Album) -> Option<Vec<String
         return None;
     }
     // No genres, try to get some from last.fm
-    match handler.lastfm.artist_top_tags(info.artist.as_ref()?).await {
+    match handler
+        .module::<Lastfm>()
+        .ok()?
+        .artist_top_tags(info.artist.as_ref()?)
+        .await
+    {
         Ok(genres) => Some(genres),
         Err(err) => {
             // Log error but carry on
@@ -140,12 +148,13 @@ impl BotCommand for Lp {
                 link = lp_name.take();
             }
         }
+        let lookup: &AlbumLookup = handler.module()?;
         let http = &ctx.http;
         // Depending on what we have, look up more information
         let mut info = match (&lp_name, &link) {
-            (Some(name), None) => handler.lookup_album(name, provider.as_deref()).await?,
+            (Some(name), None) => lookup.lookup_album(name, provider.as_deref()).await?,
             (name, Some(lnk)) => {
-                let mut info = handler.get_album_info(lnk).await?;
+                let mut info = lookup.get_album_info(lnk).await?;
                 if let Some((info, name)) = info.as_mut().zip(name.clone()) {
                     info.name = Some(name)
                 };
@@ -163,10 +172,10 @@ impl BotCommand for Lp {
         }
 
         let guild_id = command.guild_id()?.0;
-        let role_id = handler.get_role_id(guild_id).await;
+        let role_id = handler.get_guild_field(guild_id, "role_id").await?;
         let resp_content =
             build_message_contents(lp_name.as_deref(), &info, time.as_deref(), role_id).await?;
-        let webhook = handler.get_webhook(guild_id).await;
+        let webhook: Option<String> = handler.get_guild_field(guild_id, "webhook").await?;
         let wh = match webhook.as_deref().map(|url| http.get_webhook_from_url(url)) {
             Some(fut) => Some(fut.await?),
             None => None,
@@ -205,7 +214,7 @@ impl BotCommand for Lp {
             "LP created: {}",
             message.id.link(message.channel_id, command.guild_id)
         );
-        if handler.get_create_threads(guild_id).await {
+        if handler.get_guild_field(guild_id, "create_threads").await? {
             // Create a thread from the response message for the LP to take place in
             let chan = message.channel(http).await?;
             let thread_name = info.name.as_deref().unwrap_or("Listening party");
@@ -240,9 +249,11 @@ impl BotCommand for Lp {
     }
 }
 
-impl Handler {
-    pub async fn autocomplete_lp(
-        &self,
+pub struct ModLp;
+
+impl ModLp {
+    async fn autocomplete_lp(
+        handler: &Handler,
         options: &[CommandDataOption],
     ) -> anyhow::Result<Vec<(String, String)>> {
         let mut choices = vec![];
@@ -257,7 +268,11 @@ impl Handler {
                     s = stripped;
                     provider = Some("bandcamp");
                 }
-                choices = self.query_albums(s, provider).await.unwrap_or_default();
+                choices = handler
+                    .module::<AlbumLookup>()?
+                    .query_albums(s, provider)
+                    .await
+                    .unwrap_or_default();
             }
             if !s.is_empty() {
                 choices.push((s.to_string(), s.to_string()));
@@ -270,9 +285,29 @@ impl Handler {
         }
         Ok(choices)
     }
+    fn complete_lp<'a>(
+        handler: &'a Handler,
+        ctx: &'a Context,
+        key: CommandKey<'a>,
+        ac: &'a AutocompleteInteraction,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        async move {
+            if key != ("lp", CommandType::ChatInput) {
+                return Ok(false);
+            }
+            let choices = Self::autocomplete_lp(handler, &ac.data.options).await?;
+            ac.create_autocomplete_response(&ctx.http, |r| {
+                choices.into_iter().for_each(|(name, value)| {
+                    r.add_string_choice(name, value);
+                });
+                r
+            })
+            .await?;
+            Ok(true)
+        }
+        .boxed()
+    }
 }
-
-struct ModLp;
 
 #[async_trait]
 impl Module for ModLp {
@@ -283,20 +318,23 @@ impl Module for ModLp {
             .module::<Spotify>()
             .await?
             .module::<Bandcamp>()
+            .await?
+            .module::<AlbumLookup>()
             .await
     }
 
-    async fn init() -> anyhow::Result<Self> {
+    async fn init(_: &ModuleMap) -> anyhow::Result<Self> {
         Ok(ModLp)
     }
 
     async fn setup(&mut self, db: &mut Db) -> anyhow::Result<()> {
-        db.add_guild_field("create_threads", "BOOLEAN NOT NULL DEFAULT(true)")?;
+        db.add_guild_field("create_threads", "BOOLEAN NOT NULL DEFAULT(false)")?;
         db.add_guild_field("webhook", "STRING")?;
         Ok(())
     }
 
-    fn register_commands(&self, store: &mut CommandStore) {
-        // store.register::<Lp>();
+    fn register_commands(&self, store: &mut CommandStore, completions: &mut CompletionStore) {
+        store.register::<Lp>();
+        completions.push(ModLp::complete_lp);
     }
 }

@@ -4,9 +4,11 @@ use anyhow::Context as _;
 use fallible_iterator::FallibleIterator;
 use rusqlite::{params, Connection};
 use serenity::{
+    async_trait,
     model::prelude::{Message, ReactionType},
-    prelude::Context,
+    prelude::{Context, RwLock},
 };
+use serenity_command_handler::Module;
 
 use crate::Handler;
 
@@ -152,5 +154,17 @@ impl Handler {
                 .context("could not add reaction")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct ModAutoreacts {
+    cache: RwLock<ReactsCache>,
+}
+
+#[async_trait]
+impl Module for ModAutoreacts {
+    async fn init() -> anyhow::Result<Self> {
+        Ok(Default::default())
     }
 }

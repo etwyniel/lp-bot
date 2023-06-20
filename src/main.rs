@@ -53,7 +53,7 @@ use album::AlbumProvider;
 use bandcamp::Bandcamp;
 use command_context::{get_focused_option, get_str_opt_ac, Responder, SlashCommand, TextCommand};
 use db::Birthday;
-use serenity_command::{BotCommand, CommandBuilder, CommandResponse, CommandRunner};
+use serenity_command::{BotCommand, CommandBuilder, CommandKey, CommandResponse, CommandRunner};
 use spotify::Spotify;
 use tokio::sync::{self, OnceCell};
 use tokio::time::interval;
@@ -64,7 +64,7 @@ pub struct Handler {
     providers: Vec<Box<dyn AlbumProvider>>,
     lastfm: Arc<Lastfm>,
     reacts_cache: RwLock<ReactsCache>,
-    commands: RwLock<HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
+    commands: RwLock<HashMap<CommandKey<'static>, Box<dyn CommandRunner<Handler> + Send + Sync>>>,
     ready_polls: Arc<Mutex<PendingPolls>>,
     http: OnceCell<Arc<Http>>,
     last_pin_updates: Arc<Mutex<HashMap<u64, i64>>>,
@@ -82,7 +82,8 @@ impl InteractionExt for ApplicationCommandInteraction {
 }
 
 impl Handler {
-    fn init_commands() -> HashMap<&'static str, Box<dyn CommandRunner<Handler> + Send + Sync>> {
+    fn init_commands() -> HashMap<CommandKey<'static>, Box<dyn CommandRunner<Handler> + Send + Sync>>
+    {
         let mut commands = HashMap::new();
         commands::register_commands(&mut commands);
         commands
@@ -188,7 +189,7 @@ impl Handler {
             }
             "bdays" => {
                 let mut bdays = self.get_bdays(guild_id).await?;
-                let today = Utc::today();
+                let today = Utc::now().date_naive();
                 let current_day = today.day() as u8;
                 let current_month = today.month() as u8;
                 bdays.sort_unstable_by_key(|Birthday { day, mut month, .. }| {
@@ -235,7 +236,8 @@ impl Handler {
                 Ok(CommandResponse::None)
             }
             _ => {
-                if let Some(runner) = self.commands.read().await.get(cmd.name()) {
+                let key = (cmd.name(), cmd.command.data.kind);
+                if let Some(runner) = self.commands.read().await.get(&key) {
                     runner.run(self, ctx, cmd.command).await
                 } else {
                     bail!("Unknown command")
