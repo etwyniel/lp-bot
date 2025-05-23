@@ -1,43 +1,37 @@
 use std::env;
+use std::ops::DerefMut;
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
+use rspotify::scopes;
 use rusqlite::Connection;
+use serenity::all::{ApplicationId, CreateAttachment, InteractionResponseFlags};
+use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::channel::Channel;
 use serenity::model::event::ChannelPinsUpdateEvent;
-use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::prelude::{Message, UserId};
 use serenity::{
     async_trait,
     model::{
-        application::command::Command, application::interaction::Interaction,
-        gateway::GatewayIntents, gateway::Ready, id::GuildId,
+        application::Command, application::Interaction, gateway::GatewayIntents, gateway::Ready,
+        id::GuildId,
     },
     prelude::*,
 };
 
-mod magik;
 mod reltime;
 
+use serenity_command_handler::modules::bdays::Bdays;
 use serenity_command_handler::modules::quotes::{self, GetQuote};
+use serenity_command_handler::modules::sql::{Query, Sql};
 use serenity_command_handler::modules::{
-    autoreact, bdays, polls, AlbumLookup, ModAutoreacts, ModLp, ModPoll, Pinboard, Quotes,
+    autoreact, bdays, forms, polls, spotify, AlbumLookup, Forms, ModAutoreacts, ModLp, ModPoll,
+    Pinboard, PlaylistBuilder, Quotes, SpotifyOAuth,
 };
 
 use serenity_command_handler::Handler;
 
 struct HandlerWrapper(Handler);
-
-trait InteractionExt {
-    fn guild_id(&self) -> anyhow::Result<GuildId>;
-}
-
-impl InteractionExt for ApplicationCommandInteraction {
-    fn guild_id(&self) -> anyhow::Result<GuildId> {
-        self.guild_id
-            .ok_or_else(|| anyhow!("Must be run in a server"))
-    }
-}
 
 impl HandlerWrapper {
     #[allow(unused)]
@@ -48,9 +42,9 @@ impl HandlerWrapper {
         command_names: &[&str],
     ) -> anyhow::Result<()> {
         for g in guilds {
-            for cmd in g.get_application_commands(&ctx.http).await? {
+            for cmd in g.get_commands(&ctx.http).await? {
                 if command_names.contains(&cmd.name.as_str()) {
-                    g.delete_application_command(&ctx.http, cmd.id).await?;
+                    g.delete_command(&ctx.http, cmd.id).await?;
                 }
             }
         }
@@ -58,12 +52,22 @@ impl HandlerWrapper {
     }
 
     async fn process_message(&self, ctx: Context, msg: Message) -> anyhow::Result<()> {
+        // spotify::handle_message(&ctx.http, &msg).await?;
         let lower = msg.content.to_lowercase();
         if lower.starts_with(".fmcrabdown") || lower.starts_with(".crabdown") {
             let module: Arc<ModPoll> = self.0.module_arc()?;
-            polls::crabdown(module, &ctx.http, msg.channel_id, None, None).await?;
+            polls::crabdown(
+                module,
+                &ctx.http,
+                msg.channel_id,
+                None,
+                None,
+                &self.0.event_handlers,
+            )
+            .await?;
             return Ok(());
-        } else if let Some(mut params) = msg.content.strip_prefix(".lpquote") {
+        }
+        if let Some(mut params) = msg.content.strip_prefix(".lpquote") {
             let mut hide_author = None;
             if let Some(suffix) = params.strip_prefix("_trivia") {
                 params = suffix;
@@ -74,7 +78,7 @@ impl HandlerWrapper {
             let mut number: Option<i64> = params.parse().ok();
             if number.map(|n| n > 1000000).unwrap_or(false) {
                 // Treating n as a user ID
-                user = number.take().map(|n| UserId(n as u64));
+                user = number.take().map(|n| UserId::new(n as u64));
             }
             let resp = GetQuote {
                 number,
@@ -86,20 +90,44 @@ impl HandlerWrapper {
                 &ctx,
                 msg.guild_id
                     .ok_or_else(|| anyhow!("Must be run in a server"))?
-                    .0,
+                    .get(),
             )
             .await?;
 
-            let (contents, embeds, _) = match resp.to_contents_and_flags() {
+            let (contents, embeds, attachments, _) = match resp.to_contents_and_flags() {
                 None => return Ok(()),
                 Some(c) => c,
             };
+            let mut create_msg = CreateMessage::new()
+                .content(contents)
+                .embeds(embeds.into_iter().flatten().collect())
+                .allowed_mentions(CreateAllowedMentions::new().empty_roles().empty_users());
+            for att in attachments.iter().flatten() {
+                create_msg = create_msg.add_file(CreateAttachment::url(&ctx.http, att).await?);
+            }
+            msg.channel_id.send_message(&ctx.http, create_msg).await?;
+        } else if let Some(query) = msg.content.strip_prefix(".qry") {
+            let db = self.0.db.lock().await;
+            let Some((contents, embeds, _, _)) = (match (Query {
+                qry: query.trim().to_string(),
+            }
+            .query(db.conn(), msg.author.id, false))
+            {
+                Ok(resp) => resp.to_contents_and_flags(),
+                Err(e) => Some((e.to_string(), None, None, InteractionResponseFlags::empty())),
+            }) else {
+                return Ok(());
+            };
+            let msg_id = &msg;
             msg.channel_id
-                .send_message(&ctx.http, |msg| {
-                    msg.add_embeds(embeds.into_iter().collect());
-                    msg.content(contents)
-                        .allowed_mentions(|mentions| mentions.empty_roles().empty_users())
-                })
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new()
+                        .reference_message(msg_id)
+                        .content(contents)
+                        .add_embeds(embeds.into_iter().flatten().collect())
+                        .allowed_mentions(CreateAllowedMentions::new().empty_roles().empty_users()),
+                )
                 .await?;
         }
         autoreact::add_reacts(&self.0, &ctx, msg).await
@@ -116,6 +144,7 @@ impl EventHandler for HandlerWrapper {
         ModPoll::handle_ready_poll(&self.0, &ctx, &add_reaction)
             .await
             .unwrap();
+        _ = spotify::handle_reaction(&self.0, &ctx.http, &add_reaction).await;
         if !add_reaction.emoji.unicode_eq("🗨️") {
             return;
         }
@@ -124,7 +153,7 @@ impl EventHandler for HandlerWrapper {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let number = match quotes::add_quote(&self.0, &ctx, id.0, &message).await {
+            let number = match quotes::add_quote(&self.0, &ctx, id.get(), &message).await {
                 Ok(Some(n)) => n,
                 Ok(None) => return,
                 Err(e) => {
@@ -133,11 +162,13 @@ impl EventHandler for HandlerWrapper {
                 }
             };
             if let Ok(Channel::Guild(g)) = add_reaction.channel(&ctx.http).await {
-                g.send_message(&ctx.http, |m| {
-                    m.reference_message((g.id, message.id))
-                        .allowed_mentions(|mentions| mentions.empty_users())
-                        .content(&format!("Quote saved as #{number}"))
-                })
+                g.send_message(
+                    &ctx.http,
+                    CreateMessage::new()
+                        .reference_message((g.id, message.id))
+                        .allowed_mentions(CreateAllowedMentions::new().empty_users())
+                        .content(format!("Quote saved as #{number}")),
+                )
                 .await
                 .unwrap();
             }
@@ -145,12 +176,10 @@ impl EventHandler for HandlerWrapper {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let commands = Command::get_global_application_commands(&ctx.http)
-            .await
-            .unwrap();
+        let commands = Command::get_global_commands(&ctx.http).await.unwrap();
         for cmd in commands {
             if cmd.name == "build_playlist" {
-                Command::delete_global_application_command(&ctx.http, cmd.id)
+                Command::delete_global_command(&ctx.http, cmd.id)
                     .await
                     .unwrap();
             }
@@ -159,27 +188,26 @@ impl EventHandler for HandlerWrapper {
             Arc::clone(&self.0.db),
             Arc::clone(&ctx.http),
         ));
+        tokio::spawn(quotes::qotd_loop(
+            Arc::clone(&self.0.db),
+            Arc::clone(&ctx.http),
+        ));
         self.0.self_id.set(ready.user.id).unwrap();
         eprintln!("{} is running!", &ready.user.name);
         for runner in self.0.commands.read().await.0.values() {
             if let Some(guild) = runner.guild() {
-                if let Err(e) = guild
-                    .create_application_command(&ctx.http, |command| runner.register(command))
-                    .await
-                {
+                if let Err(e) = guild.create_command(&ctx.http, runner.register()).await {
                     eprintln!("error creating command {}: {}", runner.name().0, e);
                     panic!()
                 }
             } else if let Err(e) =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    runner.register(command)
-                })
-                .await
+                Command::create_global_command(&ctx.http, runner.register()).await
             {
                 eprintln!("error creating command {}: {}", runner.name().0, e);
                 panic!()
             }
         }
+        forms::check_forms(&self.0, &ctx).await.unwrap();
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
@@ -204,7 +232,30 @@ impl EventHandler for HandlerWrapper {
 #[tokio::main]
 async fn main() {
     let conn = Connection::open("lpbot.sqlite").unwrap();
-    let handler = Handler::builder(conn)
+    let spotify_oauth = SpotifyOAuth::new_auth_code(scopes!(
+        "playlist-modify-public",
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "user-library-read",
+        "user-read-private",
+        "playlist-modify-private"
+    ))
+    .await
+    .context("spotify client")
+    .unwrap();
+    let management_guild = env::var("MANAGEMENT_GUILD_ID")
+        .context("env variable MANAGEMENT_GUILD_ID missing")
+        .unwrap()
+        .parse::<u64>()
+        .map(GuildId::new)
+        .context("Failed to parse MANAGEMENT_GUILD_ID")
+        .unwrap();
+
+    let handler = Handler::builder(conn, management_guild)
+        .await
+        .with_module(spotify_oauth)
+        .await
+        .unwrap()
         .module::<ModLp>()
         .await
         .unwrap()
@@ -220,10 +271,30 @@ async fn main() {
         .module::<AlbumLookup>()
         .await
         .unwrap()
+        .module::<Bdays>()
+        .await
+        .unwrap()
         .module::<ModPoll>()
         .await
         .unwrap()
+        .module::<Sql>()
+        .await
+        .unwrap()
+        .module::<Forms>()
+        .await
+        .unwrap()
+        .module::<PlaylistBuilder>()
+        .await
+        .unwrap()
+        .default_command_handler(Forms::process_form_command)
         .build();
+
+    handler
+        .module::<ModAutoreacts>()
+        .unwrap()
+        .load_reacts(handler.db.lock().await.deref_mut())
+        .await
+        .unwrap();
 
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 
@@ -241,7 +312,7 @@ async fn main() {
             | GatewayIntents::GUILDS,
     )
     .event_handler(HandlerWrapper(handler))
-    .application_id(application_id)
+    .application_id(ApplicationId::new(application_id))
     .await
     .expect("Error creating client");
 

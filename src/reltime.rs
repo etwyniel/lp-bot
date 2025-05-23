@@ -1,10 +1,7 @@
 use anyhow::{anyhow, bail};
 use chrono::{offset::FixedOffset, prelude::*, Duration};
 use regex::Regex;
-use serenity::{
-    async_trait, model::prelude::interaction::application_command::ApplicationCommandInteraction,
-    prelude::Context,
-};
+use serenity::{async_trait, model::prelude::CommandInteraction, prelude::Context};
 use serenity_command::{BotCommand, CommandResponse};
 use serenity_command_derive::Command;
 use std::{fmt::Write, ops::Add};
@@ -33,7 +30,7 @@ impl BotCommand for Relative {
         self,
         _handler: &Handler,
         _ctx: &Context,
-        _opts: &ApplicationCommandInteraction,
+        _opts: &CommandInteraction,
     ) -> anyhow::Result<CommandResponse> {
         let parsed = parse_time(&self.time)?;
 
@@ -46,7 +43,7 @@ impl BotCommand for Relative {
             }
             out
         };
-        Ok(CommandResponse::Public(contents))
+        CommandResponse::public(contents)
     }
 }
 
@@ -79,10 +76,11 @@ pub fn parse_time(time: &str) -> anyhow::Result<Vec<(String, DateTime<FixedOffse
             dbg!(tz);
             let offset_seconds = (tz.hour_offset as i32 * 60 + tz.minute_offset as i32) * 60;
             let offset = if tz.sign.is_minus() {
-                FixedOffset::west(offset_seconds)
+                FixedOffset::west_opt(offset_seconds)
             } else {
-                FixedOffset::east(offset_seconds)
-            };
+                FixedOffset::east_opt(offset_seconds)
+            }
+            .unwrap();
             let now = Utc::now();
             let mut now_tz = now.with_timezone(&offset);
             while now_tz.minute() != minute {

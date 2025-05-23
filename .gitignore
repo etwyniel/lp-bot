@@ -3,3 +3,5 @@ serenity-command/target
 serenity-command-derive/target
 token*
 *.sqlite
+credentials.json
+rspotify_cache
