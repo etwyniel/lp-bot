@@ -2,7 +2,7 @@ use std::env;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use rspotify::scopes;
 use rusqlite::Connection;
 use serenity::all::{ApplicationId, CreateAttachment, InteractionResponseFlags};
@@ -19,14 +19,13 @@ use serenity::{
     prelude::*,
 };
 
-mod reltime;
-
+use serenity_command::ContentAndFlags;
 use serenity_command_handler::modules::bdays::Bdays;
 use serenity_command_handler::modules::quotes::{self, GetQuote};
 use serenity_command_handler::modules::sql::{Query, Sql};
 use serenity_command_handler::modules::{
-    autoreact, bdays, forms, polls, spotify, AlbumLookup, Forms, ModAutoreacts, ModLp, ModPoll,
-    Pinboard, PlaylistBuilder, Quotes, SpotifyOAuth,
+    AlbumLookup, Forms, ModAutoreacts, ModLp, ModPoll, Pinboard, PlaylistBuilder, Quotes,
+    SpotifyOAuth, autoreact, bdays, forms, polls, spotify,
 };
 
 use serenity_command_handler::Handler;
@@ -94,10 +93,11 @@ impl HandlerWrapper {
             )
             .await?;
 
-            let (contents, embeds, attachments, _) = match resp.to_contents_and_flags() {
-                None => return Ok(()),
-                Some(c) => c,
-            };
+            let ContentAndFlags(contents, embeds, attachments, _) =
+                match resp.to_contents_and_flags() {
+                    None => return Ok(()),
+                    Some(c) => c,
+                };
             let mut create_msg = CreateMessage::new()
                 .content(contents)
                 .embeds(embeds.into_iter().flatten().collect())
@@ -108,13 +108,18 @@ impl HandlerWrapper {
             msg.channel_id.send_message(&ctx.http, create_msg).await?;
         } else if let Some(query) = msg.content.strip_prefix(".qry") {
             let db = self.0.db.lock().await;
-            let Some((contents, embeds, _, _)) = (match (Query {
+            let Some(ContentAndFlags(contents, embeds, _, _)) = (match (Query {
                 qry: query.trim().to_string(),
             }
             .query(db.conn(), msg.author.id, false))
             {
                 Ok(resp) => resp.to_contents_and_flags(),
-                Err(e) => Some((e.to_string(), None, None, InteractionResponseFlags::empty())),
+                Err(e) => Some(ContentAndFlags(
+                    e.to_string(),
+                    None,
+                    None,
+                    InteractionResponseFlags::empty(),
+                )),
             }) else {
                 return Ok(());
             };
