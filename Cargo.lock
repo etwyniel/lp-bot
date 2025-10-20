@@ -2595,7 +2595,7 @@ dependencies = [
 [[package]]
 name = "serenity-command"
 version = "0.1.0"
-source = "git+https://github.com/etwyniel/discord_framework#9d5df0de79cc1d191d9f1c68006ee7ef1c7e3b68"
+source = "git+https://github.com/etwyniel/discord_framework#2e420ec098855d29452c8cb75d1ac13128e84ba8"
 dependencies = [
  "anyhow",
  "serenity",
@@ -2604,7 +2604,7 @@ dependencies = [
 [[package]]
 name = "serenity-command-derive"
 version = "0.1.0"
-source = "git+https://github.com/etwyniel/discord_framework#9d5df0de79cc1d191d9f1c68006ee7ef1c7e3b68"
+source = "git+https://github.com/etwyniel/discord_framework#2e420ec098855d29452c8cb75d1ac13128e84ba8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2615,7 +2615,7 @@ dependencies = [
 [[package]]
 name = "serenity-command-handler"
 version = "0.1.0"
-source = "git+https://github.com/etwyniel/discord_framework#9d5df0de79cc1d191d9f1c68006ee7ef1c7e3b68"
+source = "git+https://github.com/etwyniel/discord_framework#2e420ec098855d29452c8cb75d1ac13128e84ba8"
 dependencies = [
  "anyhow",
  "chrono",
