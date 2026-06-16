@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, anyhow};
 use rspotify::scopes;
 use rusqlite::Connection;
-use serenity::all::{ApplicationId, CreateAttachment, InteractionResponseFlags};
+use serenity::all::{CreateAttachment, FullEvent, MessageFlags};
 use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::channel::Channel;
 use serenity::model::event::ChannelPinsUpdateEvent;
@@ -18,19 +18,22 @@ use serenity::{
     },
     prelude::*,
 };
+use serenity_command_handler::modules::spotify_activity::SpotifyActivity;
+use serenity_command_handler::serenity;
 
 use serenity_command::ContentAndFlags;
 use serenity_command_handler::modules::bdays::Bdays;
 use serenity_command_handler::modules::quotes::{self, GetQuote};
-use serenity_command_handler::modules::sql::{Query, Sql};
+use serenity_command_handler::modules::sql::{Sql, do_query};
 use serenity_command_handler::modules::{
     AlbumLookup, Forms, ModAutoreacts, ModLp, ModPoll, Pinboard, PlaylistBuilder, Quotes,
     SpotifyOAuth, autoreact, bdays, forms, polls, spotify,
 };
 
 use serenity_command_handler::Handler;
+use serenity_command_handler::serenity::all::{CommandType, CreateCommand, Presence};
 
-struct HandlerWrapper(Handler);
+struct HandlerWrapper(Arc<Handler>);
 
 impl HandlerWrapper {
     #[allow(unused)]
@@ -50,7 +53,7 @@ impl HandlerWrapper {
         Ok(())
     }
 
-    async fn process_message(&self, ctx: Context, msg: Message) -> anyhow::Result<()> {
+    async fn process_message(&self, ctx: &Context, msg: &Message) -> anyhow::Result<()> {
         // spotify::handle_message(&ctx.http, &msg).await?;
         let lower = msg.content.to_lowercase();
         if lower.starts_with(".fmcrabdown") || lower.starts_with(".crabdown") {
@@ -86,7 +89,7 @@ impl HandlerWrapper {
             }
             .get_quote(
                 &self.0,
-                &ctx,
+                ctx,
                 msg.guild_id
                     .ok_or_else(|| anyhow!("Must be run in a server"))?
                     .get(),
@@ -100,56 +103,52 @@ impl HandlerWrapper {
                 };
             let mut create_msg = CreateMessage::new()
                 .content(contents)
-                .embeds(embeds.into_iter().flatten().collect())
+                .embeds(embeds.into_iter().flatten().collect::<Vec<_>>())
                 .allowed_mentions(CreateAllowedMentions::new().empty_roles().empty_users());
-            for att in attachments.iter().flatten() {
-                create_msg = create_msg.add_file(CreateAttachment::url(&ctx.http, att).await?);
+            for (filename, att) in attachments.into_iter().flatten() {
+                create_msg =
+                    create_msg.add_file(CreateAttachment::url(&ctx.http, att, filename).await?);
             }
             msg.channel_id.send_message(&ctx.http, create_msg).await?;
         } else if let Some(query) = msg.content.strip_prefix(".qry") {
             let db = self.0.db.lock().await;
-            let Some(ContentAndFlags(contents, embeds, _, _)) = (match (Query {
-                qry: query.trim().to_string(),
-            }
-            .query(db.conn(), msg.author.id, false))
-            {
-                Ok(resp) => resp.to_contents_and_flags(),
-                Err(e) => Some(ContentAndFlags(
-                    e.to_string(),
-                    None,
-                    None,
-                    InteractionResponseFlags::empty(),
-                )),
-            }) else {
+
+            let Some(ContentAndFlags(contents, embeds, _, _)) =
+                (match do_query(query, db.conn(), msg.author.id, false) {
+                    Ok(resp) => resp.to_contents_and_flags(),
+                    Err(e) => Some(ContentAndFlags(
+                        e.to_string(),
+                        None,
+                        None,
+                        MessageFlags::empty(),
+                    )),
+                })
+            else {
                 return Ok(());
             };
-            let msg_id = &msg;
             msg.channel_id
                 .send_message(
                     &ctx.http,
                     CreateMessage::new()
-                        .reference_message(msg_id)
+                        .reference_message(msg)
                         .content(contents)
-                        .add_embeds(embeds.into_iter().flatten().collect())
+                        .add_embeds(embeds.into_iter().flatten().collect::<Vec<_>>())
                         .allowed_mentions(CreateAllowedMentions::new().empty_roles().empty_users()),
                 )
                 .await?;
         }
-        autoreact::add_reacts(&self.0, &ctx, msg).await
+        autoreact::add_reacts(&self.0, ctx, msg).await
     }
-}
 
-#[async_trait]
-impl EventHandler for HandlerWrapper {
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+    async fn interaction_create(&self, ctx: &Context, interaction: &Interaction) {
         self.0.process_interaction(ctx, interaction).await;
     }
 
-    async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
-        ModPoll::handle_ready_poll(&self.0, &ctx, &add_reaction)
+    async fn reaction_add(&self, ctx: &Context, add_reaction: &serenity::model::channel::Reaction) {
+        ModPoll::handle_ready_poll(&self.0, ctx, add_reaction)
             .await
             .unwrap();
-        _ = spotify::handle_reaction(&self.0, &ctx.http, &add_reaction).await;
+        _ = spotify::handle_reaction(&self.0, &ctx.http, add_reaction).await;
         if !add_reaction.emoji.unicode_eq("🗨️") {
             return;
         }
@@ -158,7 +157,7 @@ impl EventHandler for HandlerWrapper {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let number = match quotes::add_quote(&self.0, &ctx, id.get(), &message).await {
+            let number = match quotes::add_quote(&self.0, ctx, id.get(), &message).await {
                 Ok(Some(n)) => n,
                 Ok(None) => return,
                 Err(e) => {
@@ -170,7 +169,7 @@ impl EventHandler for HandlerWrapper {
                 g.send_message(
                     &ctx.http,
                     CreateMessage::new()
-                        .reference_message((g.id, message.id))
+                        .reference_message(&message)
                         .allowed_mentions(CreateAllowedMentions::new().empty_users())
                         .content(format!("Quote saved as #{number}")),
                 )
@@ -180,7 +179,23 @@ impl EventHandler for HandlerWrapper {
         }
     }
 
-    async fn ready(&self, ctx: Context, ready: Ready) {
+    async fn reaction_remove(
+        &self,
+        ctx: &Context,
+        remove_reaction: &serenity::model::prelude::Reaction,
+    ) {
+        ModPoll::handle_remove_react(&self.0, ctx, remove_reaction)
+            .await
+            .unwrap()
+    }
+
+    async fn ready(&self, ctx: &Context, ready: &Ready) {
+        let self_id = &self.0.self_id;
+        if self_id.initialized() {
+            return;
+        }
+        self.0.self_id.set(ready.user.id).unwrap();
+        self.0.http.set(Arc::clone(&ctx.http)).unwrap();
         let commands = Command::get_global_commands(&ctx.http).await.unwrap();
         for cmd in commands {
             if cmd.name == "build_playlist" {
@@ -197,39 +212,78 @@ impl EventHandler for HandlerWrapper {
             Arc::clone(&self.0.db),
             Arc::clone(&ctx.http),
         ));
-        self.0.self_id.set(ready.user.id).unwrap();
         eprintln!("{} is running!", &ready.user.name);
         for runner in self.0.commands.read().await.0.values() {
-            if let Some(guild) = runner.guild() {
-                if let Err(e) = guild.create_command(&ctx.http, runner.register()).await {
-                    eprintln!("error creating command {}: {}", runner.name().0, e);
-                    panic!()
+            let mut cmd = CreateCommand::new(runner.name).kind(runner.ty);
+            if runner.ty != CommandType::Message {
+                cmd = cmd.description(runner.description)
+            }
+            cmd = (runner.register_options)(cmd);
+            if runner.is_guild {
+                let guilds = self
+                    .0
+                    .db
+                    .lock()
+                    .await
+                    .get_command_enabled_guilds(runner.name);
+                for guild_id in guilds {
+                    guild_id
+                        .create_command(&ctx.http, cmd.clone())
+                        .await
+                        .unwrap();
                 }
-            } else if let Err(e) =
-                Command::create_global_command(&ctx.http, runner.register()).await
-            {
-                eprintln!("error creating command {}: {}", runner.name().0, e);
+                continue;
+            }
+            if let Err(e) = Command::create_global_command(&ctx.http, cmd).await {
+                eprintln!("error creating command {}: {}", runner.name, e);
                 panic!()
             }
         }
-        forms::check_forms(&self.0, &ctx).await.unwrap();
+        forms::check_forms(&self.0, ctx).await.unwrap();
     }
 
-    async fn message(&self, ctx: Context, new_message: Message) {
+    async fn message(&self, ctx: &Context, new_message: &Message) {
         if let Err(e) = self.process_message(ctx, new_message).await {
             eprintln!("Error processing message: {e:?}");
         }
     }
 
-    async fn channel_pins_update(&self, ctx: Context, pin: ChannelPinsUpdateEvent) {
+    async fn channel_pins_update(&self, ctx: &Context, pin: &ChannelPinsUpdateEvent) {
         let guild_id = match pin.guild_id {
             Some(gid) => gid,
             None => return,
         };
-        if let Err(e) =
-            Pinboard::move_pin_to_pinboard(&self.0, &ctx, pin.channel_id, guild_id).await
+        if let Err(e) = Pinboard::move_pin_to_pinboard(&self.0, ctx, pin.channel_id, guild_id).await
         {
             eprintln!("Error moving message to pinboard: {e:?}");
+        }
+    }
+
+    async fn presence_update(&self, _: &Context, presence: &Presence) {
+        if let Ok(spt_act) = self.0.module::<SpotifyActivity>() {
+            spt_act.presence_update(presence).await
+        }
+    }
+}
+
+#[async_trait]
+impl EventHandler for HandlerWrapper {
+    async fn dispatch(&self, ctx: &Context, event: &FullEvent) {
+        match event {
+            FullEvent::Ready { data_about_bot, .. } => self.ready(ctx, data_about_bot).await,
+            FullEvent::Message { new_message, .. } => self.message(ctx, new_message).await,
+            FullEvent::PresenceUpdate { new_data, .. } => self.presence_update(ctx, new_data).await,
+            FullEvent::InteractionCreate { interaction, .. } => {
+                self.interaction_create(ctx, interaction).await
+            }
+            FullEvent::ReactionAdd { add_reaction, .. } => {
+                self.reaction_add(ctx, add_reaction).await
+            }
+            FullEvent::ReactionRemove {
+                removed_reaction, ..
+            } => self.reaction_remove(ctx, removed_reaction).await,
+            FullEvent::ChannelPinsUpdate { pin, .. } => self.channel_pins_update(ctx, pin).await,
+            _ => return,
         }
     }
 }
@@ -301,23 +355,20 @@ async fn main() {
         .await
         .unwrap();
 
-    let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-
-    let application_id: u64 = env::var("APPLICATION_ID")
-        .expect("Expected an application id in the environment")
-        .parse()
-        .expect("application id is not a valid id");
+    // let application_id: u64 = env::var("APPLICATION_ID")
+    //     .expect("Expected an application id in the environment")
+    //     .parse()
+    //     .expect("application id is not a valid id");
 
     // Build our client.
     let mut client = Client::builder(
-        token,
+        Token::from_env("DISCORD_TOKEN").unwrap(),
         GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::GUILD_MESSAGE_REACTIONS
             | GatewayIntents::MESSAGE_CONTENT
             | GatewayIntents::GUILDS,
     )
-    .event_handler(HandlerWrapper(handler))
-    .application_id(ApplicationId::new(application_id))
+    .event_handler(Arc::new(HandlerWrapper(handler)))
     .await
     .expect("Error creating client");
 
