@@ -15,6 +15,25 @@ anyhow = "1.0"
 fallible-iterator = "0.3"
 serenity-command = { git = "https://github.com/etwyniel/discord_framework" }
 serenity-command-handler = { git = "https://github.com/etwyniel/discord_framework" }
-image = "0.25"
+serenity-modules = {
+    git = "https://github.com/etwyniel/discord_framework",
+    features = [
+        "polls",
+        "tidal",
+        "bdays",
+        "bandcamp",
+        "lastfm",
+        "spotify",
+        "spotify_activity",
+        "album-lookup",
+        "autoreact",
+        "lp",
+        "quotes",
+        "pinboard",
+        "sql",
+        "forms",
+        "playlist_builder",
+    ]
+}
 rspotify = "0.13"
 rustls = "0.23"

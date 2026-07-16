@@ -18,14 +18,14 @@ use serenity::{
     },
     prelude::*,
 };
-use serenity_command_handler::modules::spotify_activity::SpotifyActivity;
 use serenity_command_handler::serenity;
+use serenity_modules::spotify_activity::SpotifyActivity;
 
 use serenity_command::ContentAndFlags;
-use serenity_command_handler::modules::bdays::Bdays;
-use serenity_command_handler::modules::quotes::{self, GetQuote};
-use serenity_command_handler::modules::sql::{Sql, do_query};
-use serenity_command_handler::modules::{
+use serenity_modules::bdays::Bdays;
+use serenity_modules::quotes::{self, GetQuote};
+use serenity_modules::sql::{Sql, do_query};
+use serenity_modules::{
     AlbumLookup, Forms, ModAutoreacts, ModLp, ModPoll, Pinboard, PlaylistBuilder, Quotes,
     SpotifyOAuth, autoreact, bdays, forms, polls, spotify,
 };
@@ -64,7 +64,7 @@ impl HandlerWrapper {
                 msg.channel_id,
                 None,
                 None,
-                &self.0.event_handlers,
+                &self.0.event_dispatcher,
             )
             .await?;
             return Ok(());
@@ -212,7 +212,7 @@ impl HandlerWrapper {
             Arc::clone(&self.0.db),
             Arc::clone(&ctx.http),
         ));
-        eprintln!("{} is running!", &ready.user.name);
+        eprintln!("{} is running!", ready.user.name);
         for runner in self.0.commands.read().await.0.values() {
             let mut cmd = CreateCommand::new(runner.name).kind(runner.ty);
             if runner.ty != CommandType::Message {
